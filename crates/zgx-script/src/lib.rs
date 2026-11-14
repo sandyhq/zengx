@@ -272,6 +272,22 @@ thread_local! {
     /// An unrepresentable expiry is beyond every representable instant.
     static CPU_READING: Cell<Option<(Option<Instant>, Duration)>> = const { Cell::new(None) };
 }
+/// A line a script printed, with whose it is.
+type PrintHook = Rc<dyn Fn(&str, &str)>;
+thread_local! {
+    /// `ScriptHost::on_print`'s hooks.
+    static PRINT_HOOKS: RefCell<Vec<PrintHook>> = RefCell::default();
+}
+/// Tell the print hooks: `owner` printed `line`.
+pub(crate) fn printed(owner: &str, line: &str) {
+    let hooks: Vec<PrintHook> = PRINT_HOOKS.with(|hooks| match hooks.try_borrow() {
+        Ok(hooks) => hooks.clone(),
+        Err(_) => Vec::new(),
+    });
+    for hook in hooks {
+        hook(owner, line);
+    }
+}
 /// The thread's CPU time, or a reading of it at most `CPU_READING_AGE` old.
 #[cfg(any(unix, windows))]
 fn recent_thread_cpu(now: Instant) -> Duration {
@@ -2511,6 +2527,12 @@ impl ScriptHost {
     /// Read it as `commands` changes.
     pub fn dropped_shortcuts(&self) -> Vec<DroppedShortcut> {
         self.0.commands.dropped.borrow().clone()
+    }
+    /// Call `hook(owner, line)` with each line a script prints: its name (a
+    /// plugin's) and the line, for an app's per-plugin log. (The hooks are
+    /// the thread's: every host on it hears every print.)
+    pub fn on_print(&self, hook: impl Fn(&str, &str) + 'static) {
+        PRINT_HOOKS.with(|hooks| hooks.borrow_mut().push(Rc::new(hook)));
     }
     /// Call `hook` with each script error (a failed load, an error in a
     /// handler): for an app's log or crash reports.

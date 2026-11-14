@@ -549,6 +549,31 @@ fn a_broken_plugin_is_left_out_and_the_rest_loads() {
     assert!(error.contains("plugin bug"), "{error}");
 }
 
+#[test]
+fn on_print_hears_each_line_with_whose_it_is() {
+    let heard = std::rc::Rc::new(std::cell::RefCell::new(Vec::<(String, String)>::new()));
+    let sink = heard.clone();
+    let _h = Harness::new(move |runtime| {
+        let host = ScriptHost::inline(
+            runtime,
+            "app",
+            r#"print("from the app") return ui.column { ui.slot("bar", { id = "bar" }) }"#,
+        )
+        .plugin("talker.luau", r#"print("hallo", 1)"#);
+        host.on_print(move |owner, line| sink.borrow_mut().push((owner.into(), line.into())));
+        host
+    });
+    let heard = heard.borrow().clone();
+    assert!(
+        heard.iter().any(|(owner, line)| owner.contains("talker") && line == "hallo\t1"),
+        "{heard:?}"
+    );
+    assert!(
+        heard.iter().any(|(owner, line)| !owner.contains("talker") && line == "from the app"),
+        "{heard:?}"
+    );
+}
+
 /// A 2×2 PNG.
 const PNG: &[u8] = &[
     137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 2, 0, 0, 0, 2, 8, 6, 0,

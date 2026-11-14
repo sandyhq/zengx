@@ -7569,13 +7569,18 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
     // app's output goes to a file, so prints never showed in its log).
     lua.globals().set(
         "print",
-        lua.create_function(|_, args: mlua::Variadic<mlua::Value>| {
+        lua.create_function(|lua, args: mlua::Variadic<mlua::Value>| {
             let line = args
                 .iter()
                 .map(|v| v.to_string().unwrap_or_else(|_| format!("{v:?}")))
                 .collect::<Vec<_>>()
                 .join("\t");
             eprintln!("{line}");
+            // And to the host's hooks, with whose it is (`ScriptHost::on_print`).
+            let owner = env(lua).map(|env| env.owner.clone()).ok();
+            if let Some(owner) = owner {
+                crate::printed(&owner, &line);
+            }
             Ok(())
         })?,
     )?;
