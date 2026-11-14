@@ -1868,6 +1868,9 @@ struct Host {
     /// A GPU renderer couldn't be made for content only it draws: the
     /// raster draws on without it, and none is tried again.
     gpu_refused: bool,
+    /// The renderer's context, for pictures drawn apart from the window
+    /// (`Ui::draw`): they share its device, fonts and text caches.
+    draw_context: Rc<RefCell<Option<GpuContext>>>,
     /// When to try making a renderer again after the GPU device was lost
     /// (`recover_renderer`), while none could be made.
     renderer_retry: Option<std::time::Instant>,
@@ -2272,6 +2275,21 @@ impl Host {
                 crate::thumbnail::image(&bgra, w, h, w * 4, max_width as usize)
             });
         }
+        // Pictures of a node drawn alone (`Ui::draw`): its subtree, by a
+        // renderer of its own on the window's context, into a texture read
+        // back. Nothing of it needs the window to show, so it works where
+        // the window's last frame can't be read (every platform but macOS),
+        // and for what the window doesn't show at all.
+        let draw_context: Rc<RefCell<Option<GpuContext>>> = Rc::default();
+        {
+            let (context, weak) = (draw_context.clone(), ui.downgrade());
+            ui.on_draw(move |node, rect, max_width| {
+                let context = context.borrow().clone()?;
+                let ui = weak.upgrade()?;
+                let scene = ui.scene.borrow();
+                draw_alone(&context, &scene, node, rect, max_width)
+            });
+        }
         // Devtools record and replay wheel input through this window's own
         // path (`Ui::wheel_tape`); asked nothing, it does nothing.
         let wheel_tape: std::rc::Rc<std::cell::RefCell<crate::wheel_tape::Tape>> =
@@ -2410,6 +2428,7 @@ impl Host {
             x11: false,
             scale_factor: 1.,
             display_scale: 1.,
+            draw_context,
             #[cfg(target_os = "macos")]
             shown,
             force: true,
@@ -4279,6 +4298,7 @@ impl Host {
             .retain(|context| context.lost().is_none());
         match self.make_renderer(&window) {
             Ok(mut renderer) => {
+                *self.draw_context.borrow_mut() = Some(renderer.context());
                 renderer.set_scale_factor(self.scale_factor as f32);
                 #[cfg(target_os = "macos")]
                 renderer.set_zoom(self.context.ui.zoom());
@@ -4481,6 +4501,9 @@ impl Host {
             });
         zgx::profile::mark("window created");
         let mut renderer = self.make_window_renderer(&window)?;
+        if let Some(renderer) = &renderer {
+            *self.draw_context.borrow_mut() = Some(renderer.context());
+        }
         zgx::profile::mark("renderer made");
         self.display_scale = window.scale_factor();
         // At the zoom it was left at, kept with its frame (before the zoom's
@@ -9594,6 +9617,53 @@ fn first_present_mark() -> String {
         ),
         None => "first frame presented".into(),
     }
+}
+/// `node`'s subtree of `scene` drawn alone in `rect` (`Ui::draw`), at the
+/// scene's pixel scale, shrunk to `max_width` pixels: a renderer made for
+/// the one picture on `context`, drawing as a popup's does (its root's
+/// subtree, unclipped by the window), read back. Images still decoding are
+/// waited for, a quarter of a second at most.
+fn draw_alone(
+    context: &GpuContext,
+    scene: &zgx::scene::Scene,
+    node: zgx::scene::NodeId,
+    rect: zgx::scene::Rect,
+    max_width: u32,
+) -> Option<std::sync::Arc<zgx::image::ImageData>> {
+    /// A side no texture is asked past (wgpu's least limit is 8192).
+    const SIDE: f32 = 8192.;
+    let scale = scene.pixel_scale().max(0.25);
+    if rect.width * scale > SIDE || rect.height * scale > SIDE {
+        return None;
+    }
+    let (width, height) = zgx_gpu::plane_size(rect, scale);
+    let mut renderer = GpuRenderer::new_with_context(width, height, context).ok()?;
+    renderer.set_scale_factor(scale);
+    renderer.set_background(zgx::scene::Color(0, 0, 0, 0));
+    renderer.set_popup(node, rect);
+    let until = std::time::Instant::now() + std::time::Duration::from_millis(250);
+    loop {
+        renderer.repaint_all();
+        renderer.render(scene, &[]).ok()?;
+        if !renderer.images_decoded() || std::time::Instant::now() >= until {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let mut pixels = renderer.readback().ok()?;
+    // (The target may have grown past what was asked: whole device pixels.)
+    let (width, height) = renderer
+        .plane_rect()
+        .map_or((width, height), |rect| zgx_gpu::plane_size(rect, scale));
+    let (w, h) = (width as usize, height as usize);
+    if pixels.len() != w * h * 4 {
+        return None;
+    }
+    // Read back RGBA, premultiplied; a thumbnail is made of BGRA.
+    for pixel in pixels.chunks_exact_mut(4) {
+        pixel.swap(0, 2);
+    }
+    crate::thumbnail::image(&pixels, w, h, w * 4, max_width as usize)
 }
 
 /// The system's spring-loading delay (Accessibility > Pointer Control), or

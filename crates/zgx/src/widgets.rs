@@ -2285,6 +2285,8 @@ impl EditorDrag {
 type Snapshotter = Rc<dyn Fn(Rect, u32) -> Option<std::sync::Arc<crate::image::ImageData>>>;
 type PopupSnapshotter =
     Rc<dyn Fn(NodeId, Rect, u32) -> Option<std::sync::Arc<crate::image::ImageData>>>;
+/// The host's picture of a node drawn alone (`Ui::on_draw`).
+type Drawer = Rc<dyn Fn(NodeId, Rect, u32) -> Option<std::sync::Arc<crate::image::ImageData>>>;
 /// The host's recorder and player of wheel input (`Ui::on_wheel_tape`).
 type WheelTaper = Rc<dyn Fn(WheelTape) -> Result<String, String>>;
 /// What devtools ask of the host's wheel input (`Ui::wheel_tape`): to record
@@ -2353,6 +2355,8 @@ pub(crate) struct UiStorage {
     /// The host's way to picture what the window last showed (`Ui::on_snapshot`).
     snapshotter: RefCell<Option<Snapshotter>>,
     popup_snapshotter: RefCell<Option<PopupSnapshotter>>,
+    /// The host's way to draw a node alone (`Ui::on_draw`).
+    drawer: RefCell<Option<Drawer>>,
     /// The window's zoom (`zoom`), 1 at 100%.
     pub(crate) zoom: Cell<f64>,
     /// The app turned zoom off (`set_zoomable`).
@@ -2778,6 +2782,7 @@ impl Ui {
             popup_soon_sent: Cell::new(false),
             snapshotter: RefCell::new(None),
             popup_snapshotter: RefCell::new(None),
+            drawer: RefCell::new(None),
             zoom: Cell::new(1.),
             zoom_off: Cell::new(false),
             zoom_host: RefCell::new(Vec::new()),
@@ -4163,6 +4168,46 @@ impl Ui {
         take: impl Fn(NodeId, Rect, u32) -> Option<std::sync::Arc<crate::image::ImageData>> + 'static,
     ) {
         *self.storage.popup_snapshotter.borrow_mut() = Some(Rc::new(take));
+    }
+    /// How the host draws a node alone, into a texture of its own:
+    /// `draw(node, rect, max_width)` gives `node`'s subtree, in `rect` (its
+    /// box in points, the window's coordinates, past the window as it may
+    /// be), at most `max_width` pixels wide, or `None`. What [`Ui::draw`]
+    /// uses; without it it gives nothing.
+    pub fn on_draw(
+        &self,
+        draw: impl Fn(NodeId, Rect, u32) -> Option<std::sync::Arc<crate::image::ImageData>> + 'static,
+    ) {
+        *self.storage.drawer.borrow_mut() = Some(Rc::new(draw));
+    }
+    /// A picture of `node`'s subtree drawn now, alone, in its box: not what
+    /// the window showed ([`Ui::snapshot`]) but what it would, whether or
+    /// not the window shows (it is covered, on another workspace, or the
+    /// node lies past its edge). Nothing behind the node is in it (where the
+    /// node paints nothing the picture is transparent), nor are native
+    /// views. Lays the scene out first. `None` if the host draws no
+    /// pictures, or the node is not laid out or is hidden.
+    pub fn draw(
+        &self,
+        node: NodeId,
+        max_width: u32,
+    ) -> Option<std::sync::Arc<crate::image::ImageData>> {
+        let draw = self.storage.drawer.borrow().clone()?;
+        // (What changed since the last frame, which may be long ago: a
+        // window that doesn't show draws none.)
+        let _ = self.try_prepare_frame();
+        let bounds = {
+            let mut scene = self.scene.borrow_mut();
+            scene.prepare_layout();
+            if !scene.contains(node) || !scene.layout_visible(node) {
+                return None;
+            }
+            scene.bounds(node)
+        };
+        if bounds.width <= 0. || bounds.height <= 0. {
+            return None;
+        }
+        draw(node, bounds, max_width.max(1))
     }
     /// A picture of `node` as the window last showed it (a thumbnail of a
     /// pane, say): its box, at most `max_width` pixels wide. Native views
