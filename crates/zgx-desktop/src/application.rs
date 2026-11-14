@@ -1134,7 +1134,7 @@ impl Application {
         zgx::profile::mark("event loop");
         zgx::memory::set_hosted();
         let proxy = event_loop.create_proxy();
-        let native_events = if let Some(id) = &self.application_id {
+        let native_events = if let Some(id) = self.application_id.as_ref().filter(|_| !offscreen()) {
             let wake = proxy.clone();
             let events = crate::native_events::NativeApplicationEvents::new(
                 id,
@@ -1244,6 +1244,19 @@ impl Default for Application {
     fn default() -> Self {
         Self::new()
     }
+}
+/// `ZGX_OFFSCREEN=1` (`window_chrome::OFFSCREEN`), for the host: this
+/// process's windows never reach the screen. Each is made hidden and stays
+/// so whatever the app asks (shown, focused, raised: `window_chrome::may_show`),
+/// lays out and runs its frames on a timer as a shown window does, and
+/// presents nothing: on Wayland its surface never gets a buffer, so the
+/// compositor never maps it; on X11 it is never mapped. Input comes from the
+/// app itself (a driver's clicks by selector), pictures from `Ui::draw`
+/// (drawn alone, offscreen). It takes no launches either (no application
+/// ID on the session bus). For a stand-in instance beside someone's own
+/// (Zend's plugin preview): nothing of it shows, nothing takes focus.
+pub fn offscreen() -> bool {
+    *crate::window_chrome::OFFSCREEN
 }
 /// `ZGX_RENDER_WHEN_COVERED=1`: a covered window goes on drawing, for test
 /// sessions: input and hot reloads don't stall, and automated UI and memory
@@ -3035,6 +3048,7 @@ impl Host {
         #[cfg(not(target_os = "macos"))]
         let size = window.inner_size();
         let visible = match (self.draw_hidden, self.unmapped) {
+            _ if offscreen() => Some(true),
             (true, _) => Some(true),
             (false, true) => Some(false),
             // Off-screen, never ordered in: it draws as the app has it
@@ -3120,6 +3134,12 @@ impl Host {
         let scene = self.context.ui.scene.clone();
         let mut scene = scene.borrow_mut();
         let report = scene.flush();
+        // Laid out, and nothing handed to the screen (`offscreen`).
+        if offscreen() {
+            self.force = false;
+            self.held_damage.clear();
+            return Ok(());
+        }
         // Reading it is a list a client's update needs and no other update:
         // not with none reading the tree.
         if self.context.ui.assistive_technology() {
@@ -4666,10 +4686,12 @@ impl Host {
             .set_popup_screens(self.popup_screens(&window));
         self.content_origin = crate::popup_window::content_origin(&window);
         self.window_number = crate::popup_window::window_number(&window);
-        self.frame_paced = matches!(
-            window.display_handle().map(|h| h.as_raw()),
-            Ok(RawDisplayHandle::Wayland(_))
-        );
+        // (Offscreen, no compositor grants it frames: its timer does.)
+        self.frame_paced = !offscreen()
+            && matches!(
+                window.display_handle().map(|h| h.as_raw()),
+                Ok(RawDisplayHandle::Wayland(_))
+            );
         self.present_ready = false;
         self.refresh_frame_interval(&window);
 
@@ -4954,6 +4976,12 @@ impl Host {
                     .set_presented(value && !self.state.minimized && !self.native_occluded);
                 // Shown from hidden: what changed while it was hidden is
                 // drawn first, so it appears whole (`WindowOptions::visible`).
+                if offscreen() {
+                    if value {
+                        window.request_redraw();
+                    }
+                    return;
+                }
                 if showing && let Err(error) = self.draw_hidden_frame() {
                     eprintln!("zgx: {error}");
                 }
