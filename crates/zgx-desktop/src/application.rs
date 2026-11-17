@@ -2292,12 +2292,26 @@ impl Host {
         // renderer of its own on the window's context, into a texture read
         // back. Nothing of it needs the window to show, so it works where
         // the window's last frame can't be read (every platform but macOS),
-        // and for what the window doesn't show at all.
+        // and for what the window doesn't show at all. A window drawn on
+        // the software raster has no GPU context: its pictures are drawn on
+        // one of their own, made without a window when first asked for
+        // (with the app's fonts and language), so they look as on a GPU
+        // window, transparent where nothing paints.
         let draw_context: Rc<RefCell<Option<GpuContext>>> = Rc::default();
         {
             let (context, weak) = (draw_context.clone(), ui.downgrade());
+            let own = std::cell::OnceCell::new();
+            let (fonts, language) = (windows.fonts.clone(), windows.text_language.clone());
             ui.on_draw(move |node, rect, max_width| {
-                let context = context.borrow().clone()?;
+                let window = context.borrow().clone();
+                let context = match window {
+                    Some(context) => context,
+                    None => own
+                        .get_or_init(|| {
+                            picture_context(&fonts.borrow(), language.borrow().as_deref())
+                        })
+                        .clone()?,
+                };
                 let ui = weak.upgrade()?;
                 let scene = ui.scene.borrow();
                 draw_alone(&context, &scene, node, rect, max_width)
@@ -9646,6 +9660,21 @@ fn first_present_mark() -> String {
         None => "first frame presented".into(),
     }
 }
+/// A GPU context for the pictures (`Ui::draw`) of a window that draws on
+/// the software raster, found without a window: `fonts` installed, its
+/// text in `language`. None (said once) where no GPU context can be made.
+fn picture_context(fonts: &[zgx_gpu::text::FontData], language: Option<&str>) -> Option<GpuContext> {
+    let context = GpuContext::new()
+        .inspect_err(|error| eprintln!("zgx: no GPU context for a raster window's pictures: {error}"))
+        .ok()?;
+    for font in fonts {
+        font.install(&mut context.text_system().borrow_mut());
+    }
+    if let Some(language) = language {
+        context.set_text_language(Some(language));
+    }
+    Some(context)
+}
 /// `node`'s subtree of `scene` drawn alone in `rect` (`Ui::draw`), at the
 /// scene's pixel scale, shrunk to `max_width` pixels: a renderer made for
 /// the one picture on `context`, drawing as a popup's does (its root's
@@ -9774,6 +9803,52 @@ fn copy_or_cut_editor(
 #[cfg(test)]
 mod tests {
     use zgx::scene::Rect;
+
+    /// A raster window's pictures (`Ui::draw`) are drawn on a GPU context
+    /// of their own (`picture_context`), while the window's scene was
+    /// measured and shaped by the raster's text services: its text draws
+    /// there as on the context that measured it, and the picture is
+    /// transparent where nothing paints. No GPU at all: skipped.
+    #[test]
+    fn a_raster_window_s_node_is_pictured_as_a_gpu_window_s() {
+        use zgx::scene::{Color, NodeKind, Scene, Style};
+        let Some(own) = super::picture_context(&[], None) else {
+            eprintln!("no GPU context: skipped");
+            return;
+        };
+        let picture = |install: &dyn Fn(&mut Scene), context: &zgx_gpu::GpuContext| {
+            let mut scene = Scene::new(240., 60.);
+            install(&mut scene);
+            let label = scene.append(
+                scene.root(),
+                NodeKind::Text {
+                    text: "Plugin snapshot, 42 rows".into(),
+                    color: Color(30, 30, 30, 255),
+                    font_size: 16.,
+                },
+                Style { width: Some(220.), height: Some(30.), ..Default::default() },
+            );
+            let _ = scene.flush();
+            scene.prepare_layout();
+            let bounds = scene.bounds(label);
+            super::draw_alone(context, &scene, label, bounds, 1000).expect("a picture")
+        };
+        // As a raster window has it: services of its own, not the context's.
+        let raster = zgx_gpu::TextServices::new();
+        let alone = picture(&|scene| raster.install(scene), &own);
+        // As a GPU window has it: the scene measured by its own context.
+        let window = zgx_gpu::GpuContext::new().expect("a second context");
+        let gpu = zgx_gpu::GpuRenderer::new_with_context(1, 1, &window).expect("a renderer");
+        let shown = picture(&|scene| gpu.install_text(scene), &window);
+        assert_eq!((alone.width(), alone.height()), (shown.width(), shown.height()));
+        let (a, b) = (alone.pixels(), shown.pixels());
+        let inked = a.chunks_exact(4).filter(|p| p[3] > 0).count();
+        let clear = a.chunks_exact(4).filter(|p| p[3] == 0).count();
+        assert!(inked > 50, "{inked} pixels of text drawn");
+        assert!(clear > 0, "no transparent pixel");
+        let differ = a.iter().zip(b).filter(|(x, y)| x.abs_diff(**y) > 8).count();
+        assert!(differ * 100 < a.len(), "{differ} of {} bytes differ", a.len());
+    }
 
     /// A frame answers input that acted within `INPUT_LIVE` of it, and not
     /// after; no input, none.
