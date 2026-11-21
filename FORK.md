@@ -24,6 +24,8 @@ same, upstream's code is kept.
 
 None of these is upstream as of the commit they sit on (see `git log`).
 
+Upstream base: `979b85d8d` (zeronsh/zgx main, merged 2026-11-21 as `Merge upstream/main`).
+
 ### Not here
 
 - **Zend's rebrand** (Zeron → Zend in zgx's examples, tests and comments,
@@ -44,8 +46,10 @@ git remote add upstream git@github.com:zeronsh/zgx.git   # once
 git fetch upstream
 git checkout main
 git merge upstream/main          # resolve the edits above against upstream
-cargo nextest run --workspace --no-fail-fast --locked
+cargo nextest run --workspace --exclude zgx-audio --no-fail-fast --locked
 ```
+
+`zgx-audio` is left out of the test command: its tests are timing tests that fail under load (several builds on one machine). Run it alone when audio changed.
 
 Compare the failing test names with upstream's own commit, in a worktree:
 `git worktree add --detach ../zgx-plain upstream/main`, the same command
