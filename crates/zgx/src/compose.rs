@@ -133,10 +133,41 @@ pub(crate) struct Environment {
     typography: Signal<Typography>,
     registry: Registry,
     portal: Option<(NodeId, Signal<bool>)>,
-    menu: Option<Rc<crate::compose_menu::MenuContext>>,
+    /// The menu around it and whether an ancestor is disabled (`EnvRare`):
+    /// one pointer, `None` in most subtrees.
+    rare: Option<Rc<EnvRare>>,
     measure: crate::rich_text::TextMeasure,
     /// The theme scope styles in this subtree resolve tokens from.
     pub(crate) theme: Rc<crate::theme::ThemeScope>,
+}
+/// What few subtrees' environments hold, behind one pointer: the
+/// environment is cloned for every mount, so it stays small.
+#[derive(Clone, Default)]
+struct EnvRare {
+    menu: Option<Rc<crate::compose_menu::MenuContext>>,
+    /// Whether an ancestor is disabled, read where it is asked (tracked):
+    /// only below a view that can be disabled (`View::disabled_when`).
+    disabled: Option<Rc<dyn Fn() -> bool>>,
+}
+impl Environment {
+    /// The menu this subtree is in.
+    pub(crate) fn menu(&self) -> Option<Rc<crate::compose_menu::MenuContext>> {
+        self.rare.as_ref()?.menu.clone()
+    }
+    pub(crate) fn set_menu(&mut self, menu: Option<Rc<crate::compose_menu::MenuContext>>) {
+        let mut rare = self.rare.as_deref().cloned().unwrap_or_default();
+        rare.menu = menu;
+        self.rare = Some(Rc::new(rare));
+    }
+    /// Whether an ancestor is disabled, if one can be.
+    fn disabled_above(&self) -> Option<Rc<dyn Fn() -> bool>> {
+        self.rare.as_ref()?.disabled.clone()
+    }
+    fn set_disabled_above(&mut self, disabled: Rc<dyn Fn() -> bool>) {
+        let mut rare = self.rare.as_deref().cloned().unwrap_or_default();
+        rare.disabled = Some(disabled);
+        self.rare = Some(Rc::new(rare));
+    }
 }
 /// Mount-time component context. State is allocated once; there are no positional hooks.
 pub struct Context {
@@ -654,6 +685,25 @@ fn merge_accessibility(
     }
 }
 impl Rare {
+    /// Its text area's atoms' options, taken for the DOM, which shows them
+    /// itself (`ElementKind::Editor`): none where none is set.
+    #[cfg(feature = "dom")]
+    pub(crate) fn take_atoms(&mut self) -> Option<Box<__dom::DomAtoms>> {
+        let code = self.code.as_deref_mut()?;
+        if code.atoms_when.is_none()
+            && code.on_atoms.is_none()
+            && code.atom_wash.is_none()
+            && code.atom_style.is_none()
+        {
+            return None;
+        }
+        Some(Box::new(__dom::DomAtoms {
+            when: code.atoms_when.take(),
+            on_atoms: code.on_atoms.take(),
+            wash: code.atom_wash.take(),
+            style: code.atom_style.take(),
+        }))
+    }
     /// `View::refine`'s part: what an outer view sets over its inner one.
     fn merge_into(self, inner: &mut Rare) {
         if self.trigger_id.is_some() {
@@ -5378,15 +5428,10 @@ fn mount_portal_panel(
     }
     environment.portal = Some((portal.overlay, portal.visible.clone()));
     let menu_context = is_menu.then(|| {
-        crate::compose_menu::MenuContext::new(
-            open.clone(),
-            environment.menu.clone(),
-            anchor,
-            is_submenu,
-        )
+        crate::compose_menu::MenuContext::new(open.clone(), environment.menu(), anchor, is_submenu)
     });
     if let Some(menu) = &menu_context {
-        environment.menu = Some(menu.clone());
+        environment.set_menu(Some(menu.clone()));
     }
 
     let options = view.rare.as_ref().and_then(|r| r.portal.as_ref());
@@ -5764,6 +5809,7 @@ fn mount_portal_panel(
             (_, true) => crate::scene::PopupRole::Tooltip,
             _ => crate::scene::PopupRole::Popover,
         };
+        ui.register_popup(portal.position, open_signal.clone(), role);
         ui.bind(owner, move || {
             let popup = visible.get() && screens.with(|screens| !screens.is_empty());
             if let Some(ui) = weak.upgrade() {
@@ -5778,7 +5824,6 @@ fn mount_portal_panel(
                 }
             }
         });
-        ui.register_popup(portal.position, open_signal);
     }
     // A submenu's layer lets the pointer through to its parent menu.
     if is_submenu {
@@ -5904,6 +5949,39 @@ impl WidgetStyles {
 fn dim_when_disabled(view: &mut View) {
     if view.variants.disabled.is_none() {
         view.variants.disabled = Some(Box::new(Styles::new().opacity(0.45)));
+    }
+}
+/// A view disabled, or under one that is: what its children read (an
+/// ancestor disabled, followed), and what its style reads, as a node
+/// disabled itself is when it has disabled styles of its own: it or an
+/// ancestor disabled. A node with no disabled style reads nothing of its
+/// ancestors (input and assistive technology walk them).
+#[cold]
+#[inline(never)]
+fn inherit_disabled(
+    ui: &mut Ui,
+    root: NodeId,
+    environment: &mut Environment,
+    own: Option<Box<dyn FnMut() -> bool>>,
+    variants: &crate::compose_style::Variants,
+) -> Option<Box<dyn FnMut() -> bool>> {
+    let above = environment.disabled_above();
+    if own.is_some() {
+        let here = ui.input.observe_disabled(root, &ui.runtime);
+        let up = above.clone();
+        environment.set_disabled_above(Rc::new(move || {
+            here.get() || up.as_ref().is_some_and(|up| up())
+        }));
+    }
+    let Some(above) = above else {
+        return own;
+    };
+    match own {
+        Some(mut own) => Some(Box::new(move || own() || above())),
+        None if variants.disabled.is_some() || variants.reactive.is_some() => {
+            Some(Box::new(move || above()))
+        }
+        None => None,
     }
 }
 fn widget_style(pick: impl FnOnce(&WidgetStyles) -> &Styles) -> Styles {
@@ -6763,7 +6841,7 @@ fn open_element(
     // A trigger drawn by the app (`View::trigger`) shows its own chevron.
     let submenu_indicator = is_submenu_trigger && view.children.is_empty();
     // Outside a menu (a popover's list) an item is a plain action.
-    let item_menu = is_menu_item.then(|| environment.menu.clone()).flatten();
+    let item_menu = is_menu_item.then(|| environment.menu()).flatten();
     let is_editor = matches!(kind, Kind::Editor { .. });
     assert!(
         rare.as_deref().is_none_or(|r| r.read_only.is_none()) || is_editor,
@@ -7393,6 +7471,14 @@ fn open_element(
         false => rare.as_deref_mut().and_then(|r| r.layout_target.take()),
     };
     let image_fit = is_image.then(|| ui.signal(crate::style::ImagePlacement::default()));
+    if view.disabled.is_some()
+        || environment
+            .rare
+            .as_ref()
+            .is_some_and(|r| r.disabled.is_some())
+    {
+        view.disabled = inherit_disabled(ui, root, &mut environment, view.disabled, &view.variants);
+    }
     environment.typography = mount_style_with_intrinsic(
         ui,
         root,
@@ -8120,7 +8206,8 @@ impl ListStretch {
 /// How far scroll view `viewport` (the node holding its content) moves its
 /// content along its axis so focused `target` inside shows: the least
 /// (CSS's `nearest`), the view's `scroll_padding` kept clear; 0 where it
-/// shows, or spans the view. None if either is gone.
+/// shows, or spans the view. None if either is gone. The rule and the
+/// padding are `NodeHandle::scroll_into_view`'s (`scroll_reveal`).
 pub(crate) fn focus_movement(
     ui: &Ui,
     target: NodeId,
@@ -8133,34 +8220,12 @@ pub(crate) fn focus_movement(
         return None;
     }
     let target = scene.bounds(target);
-    let visible = scene.bounds(viewport);
-    let (target_start, target_size, visible_start, visible_size) = if horizontal {
-        let size = (visible.width - padding.left - padding.right).max(0.);
-        (target.x, target.width, visible.x + padding.left, size)
-    } else {
-        let size = (visible.height - padding.top - padding.bottom).max(0.);
-        (target.y, target.height, visible.y + padding.top, size)
+    let shown = crate::scroll_reveal::padded(scene.bounds(viewport), padding);
+    let (start, size, from, length) = match horizontal {
+        true => (target.x, target.width, shown.x, shown.width),
+        false => (target.y, target.height, shown.y, shown.height),
     };
-    let start_delta = target_start as f64 - visible_start as f64;
-    let end_delta =
-        target_start as f64 + target_size as f64 - visible_start as f64 - visible_size as f64;
-    Some(if start_delta < 0. && end_delta > 0. {
-        0. // Oversized targets already spanning the viewport stay put.
-    } else if start_delta < 0. {
-        if target_size > visible_size {
-            end_delta
-        } else {
-            start_delta
-        }
-    } else if end_delta > 0. {
-        if target_size > visible_size {
-            start_delta
-        } else {
-            end_delta
-        }
-    } else {
-        0.
-    })
+    Some(crate::scroll_reveal::shift(RowAlign::Nearest, start, size, from, length, 0.) as f64)
 }
 /// Where a list that scrolls with the scroll view around it
 /// (`View::virtualize_in_ancestor`) shows: its viewport's place, and those
@@ -8236,7 +8301,9 @@ impl AncestorWindow {
             _ => {
                 #[cfg(test)]
                 WINDOW_CLIP_WALKS.with(|walks| walks.set(walks.get() + 1));
-                scene.visible_bounds(self.viewport)
+                // However transparent: rows under an ancestor fading in
+                // are built as it starts, not once something moves.
+                scene.clipped_bounds_shown(self.viewport)
             }
         };
         match shown {
@@ -10301,7 +10368,7 @@ impl Ui {
             typography,
             registry: registry.clone(),
             portal: None,
-            menu: None,
+            rare: None,
             measure: self.scene.borrow().text_measure(),
             theme,
         };

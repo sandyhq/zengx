@@ -1475,6 +1475,15 @@ impl QuadStyle {
             None => painted,
         }
     }
+    /// `paint_bounds` without its shadows: where the box itself and its
+    /// outline paint.
+    #[doc(hidden)]
+    pub fn body_bounds(&self, bounds: Rect) -> Rect {
+        match self.outline.filter(Outline::visible) {
+            Some(outline) => bounds.union(outline.outer(bounds)),
+            None => bounds,
+        }
+    }
     /// Whether it paints nothing at all: a box held for its layout or clip.
     pub fn paints_nothing(&self) -> bool {
         self.fill.3 == 0
@@ -1943,6 +1952,9 @@ fn repaint_flags(dirty: u8) -> u8 {
 /// `Node::boxed`'s bits.
 const REPLACED: u8 = 1;
 const HIT_INSIDE: u8 = 2;
+/// Its `bounds` lie off the device pixel grid (`Scene::off_grid`): only
+/// these a snapping walk rounds (`snapped_bounds`).
+const OFF_GRID: u8 = 4;
 /// Whether `new` differs from `old` in colour alone (`PAINT_ONLY`): a rect's
 /// colour, a text's colour, a box's fill or border colour (with no
 /// decoration, whose rasters are kept apart).
@@ -2130,6 +2142,7 @@ struct Node {
     /// box is. Unmarked (a raw `append`, or a kind set since), a picture may
     /// be hit past its box, so no proof under it holds. One byte: a node is
     /// no larger than a bool made it.
+    /// `OFF_GRID`: its `bounds` lie off the device pixel grid.
     boxed: u8,
     /// Its lines run right to left (`Scene::set_direction`, its own or its
     /// parent's): `style` is then laid out mirrored (`laid_out_style`).
@@ -3671,6 +3684,9 @@ pub struct Scene {
     /// Device pixels a point (`set_pixel_scale`): scroll content moves by
     /// whole ones. 0 until a host says.
     pixel_scale: f32,
+    /// How many nodes are `OFF_GRID`: with none, and nothing laid out since
+    /// the last flush, a walk's boxes are all on the grid (`snap_needed`).
+    off_grid_count: usize,
     /// The moves reported by the last flush, and that flush's serial.
     moves: Vec<ScrollMove>,
     flush_serial: u64,
@@ -3844,6 +3860,7 @@ impl Scene {
             platform_nodes: Vec::new(),
             pending_moves: Vec::new(),
             pixel_scale: 0.,
+            off_grid_count: 0,
             moves: Vec::new(),
             flush_serial: 0,
             repaints: Vec::new(),
@@ -4012,6 +4029,22 @@ impl Scene {
         self.damage_subtree(id);
         self.geometry_revision = self.geometry_revision.wrapping_add(1);
         self.invalidate(id, COMPOSITE);
+    }
+    /// Every popup root wanted (`set_popup`), those held back while the app
+    /// is at the back (`set_popups_held`) too: what `popups` lists is what a
+    /// host shows.
+    #[doc(hidden)]
+    pub fn wanted_popups(&self) -> &[NodeId] {
+        &self.popups
+    }
+    /// Whether `id` is in a popup that is wanted but held back, not shown
+    /// nor hit while the app is at the back (`set_popups_held`).
+    #[doc(hidden)]
+    pub fn in_held_popup(&self, id: NodeId) -> bool {
+        self.popups_held
+            && self
+                .popup_holding(id)
+                .is_some_and(|root| self.popup_held(root))
     }
     /// Roots shown in popup windows (`set_popup`), in the order set; those
     /// held while the app is at the back (`set_popups_held`) aren't listed.
@@ -4907,6 +4940,34 @@ impl Scene {
         if effects.opacity <= 0. {
             return None;
         }
+        if !self.popups.is_empty()
+            && let Some(shown) = self.visible_in_popup(id)
+        {
+            return shown;
+        }
+        if self.transformed > 0 {
+            let (bounds, clip, placement) = self.placed(id);
+            let visible = bounds.intersection(clip.unwrap_or(UNCLIPPED))?;
+            return match placement {
+                Some(placement) => placement
+                    .matrix
+                    .bounds(visible)
+                    .intersection(placement.clip),
+                None => Some(visible),
+            };
+        }
+        bounds.intersection(clip.unwrap_or(self.viewport))
+    }
+    /// The part of `id`'s box inside its clips and the viewport, however
+    /// transparent: `visible_bounds` without its opacity test. Where a list
+    /// scrolled by the views around it builds rows (`AncestorWindow`):
+    /// geometry, as a page's intersection observer reads it, so rows under an
+    /// ancestor fading in from nothing (a presence's `enter`) are built as it
+    /// starts to show, not when something next moves.
+    #[inline(never)]
+    pub(crate) fn clipped_bounds_shown(&self, id: NodeId) -> Option<Rect> {
+        self.note_geometry_read(id);
+        let (bounds, _, clip) = self.world_once(id);
         if !self.popups.is_empty()
             && let Some(shown) = self.visible_in_popup(id)
         {
@@ -7956,6 +8017,10 @@ impl Scene {
             shaper.shape(text, size, width, font)
         } else if font.line_height != crate::text_layout::LineHeight::NORMAL
             || font.letter_spacing != crate::text_layout::LetterSpacing::ZERO
+            || !matches!(
+                font.align,
+                crate::text_layout::TextAlign::Start | crate::text_layout::TextAlign::Left
+            )
         {
             self.shape_text_with_metrics(text, size, width, font)
         } else {
@@ -7963,8 +8028,8 @@ impl Scene {
         }
     }
     /// `shape_text_with_font` with no font shaper and explicit metrics
-    /// (letter spacing, a line height): apart, so the common call stays as
-    /// small as it is.
+    /// (letter spacing, a line height) or an alignment: apart, so the common
+    /// call stays as small as it is.
     #[inline(never)]
     fn shape_text_with_metrics(
         &self,
@@ -7974,8 +8039,12 @@ impl Scene {
         font: &crate::text_layout::FontStyle,
     ) -> Box<dyn crate::text_layout::TextLayout> {
         match self.text_shaper.as_deref() {
-            // A shaper taking no font: its advances, spaced as the GPU's.
-            Some(shaper) if font.letter_spacing != crate::text_layout::LetterSpacing::ZERO => {
+            // A shaper taking no font: its advances, spaced as the GPU's, or
+            // aligned (its rows moved as the font says) at its own line height.
+            Some(shaper)
+                if font.letter_spacing != crate::text_layout::LetterSpacing::ZERO
+                    || font.line_height == crate::text_layout::LineHeight::NORMAL =>
+            {
                 Box::new(crate::text_layout::FallbackTextLayout::spaced(
                     shaper, text, size, width, font,
                 ))
@@ -8548,13 +8617,13 @@ impl Scene {
     /// returns their ids, `id` first, none of which the scene contains from
     /// now on (nothing reaches them: their generations have moved on, and
     /// the lists that name nodes no longer name them). For a large subtree:
-    /// the whole viewport repaints, rather than each node's ink. Panics for
-    /// the root.
+    /// what it showed repaints as one area, its ink (`damage_taken_out`),
+    /// rather than each node's. Panics for the root.
     pub(crate) fn kill(&mut self, id: NodeId) -> Vec<NodeId> {
         self.finish_pending_children();
         self.content_revision = self.content_revision.wrapping_add(1);
         assert_ne!(id, self.root, "cannot remove scene root");
-        self.add_damage(self.viewport);
+        self.damage_taken_out(id);
         let parent = self.node(id).parent.unwrap();
         self.node_mut(parent)
             .children
@@ -8601,6 +8670,43 @@ impl Scene {
         self.children_changed(parent);
         ids
     }
+    /// Damage what subtree `id`, about to be taken out whole (`kill`),
+    /// showed: its ink, the union of all it paints (each node's paint, its
+    /// shadows and blurs, cut by the clips inside it, as the paint walks
+    /// keep it), where its parent places it and within the clips round it.
+    /// One area, worked out from what the walks keep, not a walk of its
+    /// nodes: a page of thousands repaints the part of the window it was
+    /// on (a chat's transcript, not the sidebar and title bar beside it).
+    /// As `damage_subtree_with` damages: a subtree hidden or never laid out
+    /// damages nothing, and one in a popup root's window, nothing here.
+    fn damage_taken_out(&mut self, id: NodeId) {
+        let node = self.node(id);
+        let unplaced = node.measurement.is_none() && node.bounds == Rect::default();
+        if !own_visible(&node.style) || unplaced || self.damage_is_full() {
+            return;
+        }
+        let Some(parent) = node.parent else {
+            return self.add_damage(self.viewport);
+        };
+        if self.transformed + self.filtered.get() > 0 {
+            if self.filtered.get() & POPUPS_BIT != 0 && self.popup_holding(id).is_some() {
+                return;
+            }
+            if !self.shown(parent) {
+                return;
+            }
+            // Mapped through the layers round it, their blurs' spread too.
+            let ink = self.ink_alone(id);
+            let (transform, clip, placement) = self.context(parent);
+            self.damage_within_placed(ink.map(|ink| ink.translated(transform)), clip, placement);
+            return;
+        }
+        let Some((transform, clip)) = self.shown_context(parent) else {
+            return;
+        };
+        let ink = self.ink_alone(id);
+        self.damage_within(ink.map(|ink| ink.translated(transform)), clip);
+    }
     /// Free the slot of `id`, a node `kill` took out (and not its subtree,
     /// whose nodes come in turn).
     pub(crate) fn free_dead(&mut self, id: NodeId) {
@@ -8615,6 +8721,9 @@ impl Scene {
     /// What the scene keeps about `node`, gone, but in the lists `kill`
     /// filters.
     fn forget(&mut self, id: NodeId, node: &Node) {
+        if node.boxed & OFF_GRID != 0 {
+            self.off_grid_count -= 1;
+        }
         let long = self.long_children.get_mut();
         if !long.is_empty() {
             long.remove(&id);
@@ -11665,6 +11774,20 @@ impl Scene {
         let bounds = node.bounds.translated(transform);
         (bounds, effects, self.world_clip(id))
     }
+    /// Repaint all that `id` shows: its clip, which holds what it and its
+    /// descendants paint. For content about to move most of its view (a
+    /// page): what it changes then is held by that one area at once
+    /// (`recent_damage`), not joined into a list of areas that don't meet.
+    /// Under a transformed or filtered node the clip is not where it shows:
+    /// nothing is added, and its changes damage as they come.
+    pub(crate) fn damage_shown(&mut self, id: NodeId) {
+        if self.transformed + self.filtered.get() > 0 {
+            return;
+        }
+        if let Some(clip) = self.world_clip(id) {
+            self.add_damage(clip);
+        }
+    }
     /// `world`'s clip alone (`.2`): what `id` paints within, from its own
     /// and its ancestors' clips, each at its box translated by its own and
     /// its ancestors' translations, summed from it upwards.
@@ -12158,9 +12281,17 @@ impl Scene {
     }
     /// See `Node::ink`. Computed on demand and cached until invalidated.
     fn ink(&self, id: NodeId) -> Option<Rect> {
+        self.ink_of(id, self.node(id))
+    }
+    /// `ink` of a node reached through the tree (a child, as the ink and
+    /// paint walks find them): looked up unchecked (`tree_node`).
+    #[inline]
+    fn child_ink(&self, id: NodeId) -> Option<Rect> {
+        self.ink_of(id, self.tree_node(id))
+    }
+    fn ink_of(&self, id: NodeId, node: &Node) -> Option<Rect> {
         #[cfg(test)]
         self.inks_asked.set(self.inks_asked.get() + 1);
-        let node = self.node(id);
         if node.bounds_valid.get() & INK_VALID != 0 {
             return node.ink.get();
         }
@@ -12177,7 +12308,7 @@ impl Scene {
             false => {
                 let mut held: Option<Rect> = None;
                 for child in children {
-                    if let Some(child) = crate::deep(0, || self.ink(*child)) {
+                    if let Some(child) = crate::deep(0, || self.child_ink(*child)) {
                         held = Some(held.map_or(child, |ink| ink.union(child)));
                     }
                 }
@@ -12284,7 +12415,7 @@ impl Scene {
                     -1.
                 };
             }
-            let ink = crate::deep(0, || self.ink(*child));
+            let ink = crate::deep(0, || self.child_ink(*child));
             if let Some(child) = ink {
                 match kept {
                     true => {
@@ -12383,7 +12514,7 @@ impl Scene {
                 // since but not worked out again (that would have dropped the
                 // union).
                 let was = node.ink.get().map(ink_edges);
-                let ink = crate::deep(0, || self.ink(child));
+                let ink = crate::deep(0, || self.child_ink(child));
                 if let Some(was) = was {
                     let now = ink.map(ink_edges)?;
                     if now[0] > was[0] || now[1] > was[1] || now[2] < was[2] || now[3] < was[3] {
@@ -12410,7 +12541,7 @@ impl Scene {
         let count = children.len().saturating_sub(KEPT_TAIL).max(entry.count);
         let (mut tail, mut reach) = (None, prefix_reach);
         for (index, &child) in children.iter().enumerate().skip(entry.count) {
-            let ink = crate::deep(0, || self.ink(child));
+            let ink = crate::deep(0, || self.child_ink(child));
             if reach >= 0. {
                 let at = shown(child);
                 reach = match in_order(index, at) {
@@ -14655,11 +14786,16 @@ impl Scene {
     /// the children before it over it, within its box.
     fn measure_contents(&mut self, id: NodeId, constraints: Constraints) -> (f32, f32) {
         self.node_mut(id).advanced_layout = None;
-        let ids = self.children_raw(self.node(id)).clone();
-        let lead = *ids.last().unwrap();
+        // Its children read in place, one at a time, not copied first:
+        // measuring one changes no parent's list.
+        let count = self.children_raw(self.node(id)).len();
+        let lead = self.children_raw(self.node(id))[count - 1];
         let size = self.measure(lead, constraints);
-        let mut children = Vec::with_capacity(ids.len());
-        for child in ids {
+        let mut children = Vec::with_capacity(count);
+        for at in 0..count {
+            let Some(&child) = self.children_raw(self.node(id)).get(at) else {
+                break;
+            };
             if child == lead {
                 children.push((child, Rect::new(0., 0., size.0, size.1), constraints));
                 continue;
@@ -15483,6 +15619,14 @@ impl Scene {
         self.pending_layout_nodes += report.layout_nodes;
         self.layout_revision = self.layout_revision.wrapping_add(1);
         self.unmoved = self.unmoved.wrapping_add(1);
+        // Which boxes this layout moved off the device pixel grid
+        // (`OFF_GRID`): every box layout places is placed here, so a walk's
+        // bits are always its boxes' own. Without a pixel scale, a test.
+        if self.pixel_scale > 0. {
+            let dirty = std::mem::take(&mut self.dirty);
+            self.note_off_grid(&dirty);
+            self.dirty = dirty;
+        }
     }
     /// Lay out, paint and composite what changed since the last flush, and
     /// report the damage.
@@ -15712,6 +15856,13 @@ impl Scene {
             cold.snapping.remove(&id);
         }
     }
+    /// Whether `id`'s translation stays on whole device pixels
+    /// (`set_pixel_snap`).
+    pub(crate) fn snaps_to_pixels(&self, id: NodeId) -> bool {
+        self.cold
+            .as_ref()
+            .is_some_and(|cold| cold.snapping.get(&id) == Some(&true))
+    }
     /// Each snapping node's translation (`set_pixel_snap`) on whole device
     /// pixels, as its writers left it: once a frame, before layout. Nodes
     /// gone since are let go of.
@@ -15771,6 +15922,13 @@ impl Scene {
             return;
         }
         self.pixel_scale = scale;
+        // Which boxes lie off the new grid (`off_grid`), each node's.
+        self.off_grid_count = 0;
+        for node in self.slots.iter_mut().filter_map(|slot| slot.node.as_mut()) {
+            let off_grid = scale > 0. && snap_box(node.bounds, scale) != node.bounds;
+            node.boxed = node.boxed & !OFF_GRID | if off_grid { OFF_GRID } else { 0 };
+            self.off_grid_count += usize::from(off_grid);
+        }
         // What scrolled before is put on the new grid.
         let mut contents = Vec::new();
         let mut stack = vec![self.root()];
@@ -16206,7 +16364,13 @@ impl Scene {
             if dx == 0. && dy == 0. {
                 continue;
             }
-            let clip = self.world_clip(id);
+            // Its clip as a snapping walk paints boxes (`snapped_bounds`): what the copy
+            // moves is the pixels shown, not layout's box between them. Out of
+            // line (`snap_clip`): `flush`, which inlines this, keeps its shape.
+            let clip = match self.world_clip(id) {
+                Some(clip) if self.pixel_scale > 0. => Some(snap_clip(clip, self.pixel_scale)),
+                clip => clip,
+            };
             let isolated = layered;
             // Clear of what blurs what's behind it: a glass bar over the view takes
             // only the view's band it reaches, and what's beside it still moves.
@@ -16243,6 +16407,10 @@ impl Scene {
                 }
             }
         }
+        // (One move, the usual frame, asks nothing.)
+        if moves.len() > 1 {
+            self.merge_alike_moves(&mut moves);
+        }
         // Nested or overlapping moves: repaint instead.
         let overlapping: Vec<usize> = (0..moves.len())
             .filter(|&i| {
@@ -16278,6 +16446,31 @@ impl Scene {
                 self.add_damage(rect);
             }
             self.moves.push(scroll);
+        }
+    }
+    /// Content moved as one: layers in the same view moved the same way (a
+    /// text area's marks under its lines) are one copy of that view, the
+    /// first's, the others taken out of `moves` in place. Not one nested in
+    /// another: it moves by both there. The distance is compared first; a
+    /// move unlike those before it asks no more.
+    #[cold]
+    #[inline(never)]
+    fn merge_alike_moves(&self, moves: &mut Vec<ScrollMove>) {
+        let mut at = 1;
+        while at < moves.len() {
+            let scroll = &moves[at];
+            let same = moves[..at].iter().any(|other| {
+                other.dx == scroll.dx
+                    && other.dy == scroll.dy
+                    && other.clip == scroll.clip
+                    && !self.is_within(scroll.node, other.node)
+                    && !self.is_within(other.node, scroll.node)
+            });
+            if same {
+                moves.remove(at);
+            } else {
+                at += 1;
+            }
         }
     }
     /// For scroll content `id` that moved by `dx`, `dy` this frame and repaints
@@ -16666,7 +16859,7 @@ impl Scene {
                 children
                     .iter()
                     .filter(|child| {
-                        self.ink(**child)
+                        self.child_ink(**child)
                             .is_some_and(|ink| ink.translated(transform).intersects(clip))
                     })
                     .map(|child| (*child, transform)),
@@ -16845,6 +17038,205 @@ impl Scene {
             ink.width > 0. && ink.height > 0. && ink.translated(transform).intersects(clip)
         })
     }
+    /// Whether `bounds` lie off the device pixel grid: what snapping them
+    /// would move (`snapped_bounds`).
+    #[cfg(debug_assertions)]
+    fn off_grid(&self, bounds: Rect) -> bool {
+        self.pixel_scale > 0. && snap_box(bounds, self.pixel_scale) != bounds
+    }
+    /// `OFF_GRID` for each of `ids` layout placed this flush (`PAINTED`),
+    /// once, so a walk tests a bit, not its edges. Out of line: only a
+    /// flush with a pixel scale calls it.
+    #[inline(never)]
+    fn note_off_grid(&mut self, ids: &[NodeId]) {
+        let scale = self.pixel_scale;
+        if scale <= 0. {
+            return;
+        }
+        for &id in ids {
+            if !self.contains(id) {
+                continue;
+            }
+            let node = self.tree_node_mut(id);
+            if node.dirty & PAINTED == 0 {
+                continue;
+            }
+            let off = snap_flagged(node.bounds, scale) != node.bounds;
+            let was = node.boxed & OFF_GRID != 0;
+            node.boxed = node.boxed & !OFF_GRID | if off { OFF_GRID } else { 0 };
+            if off != was {
+                match off {
+                    true => self.off_grid_count += 1,
+                    false => self.off_grid_count -= 1,
+                }
+            }
+        }
+    }
+    /// Whether a paint walk from `root` puts its boxes' edges on whole
+    /// device pixels (`snapped_bounds`): with a pixel scale, from the window or
+    /// a layer nothing transformed holds. What a transform, a zoom or a tilt
+    /// holds is drawn in its own space and keeps layout's places.
+    fn walk_snaps(&self, root: Option<NodeId>) -> bool {
+        if self.pixel_scale <= 0. {
+            return false;
+        }
+        let mut at = root;
+        while let Some(id) = at {
+            // (No panic here: `snap_items_entry` can't unwind. An id the
+            // scene doesn't hold isn't snapped.)
+            let Some(node) = self.node_if(id) else {
+                return false;
+            };
+            if node.transformed() {
+                return false;
+            }
+            at = node.parent;
+        }
+        true
+    }
+    /// Node `id`, if the scene holds it: `node` without its panic, for what
+    /// `snap_items_entry` reaches.
+    #[inline]
+    fn node_if(&self, id: NodeId) -> Option<&Node> {
+        self.slots
+            .get(id.index as usize)
+            .filter(|slot| slot.generation == id.generation)
+            .and_then(|slot| slot.node.as_ref())
+    }
+    /// Whether a walk's boxes may need putting on device pixels: with a
+    /// pixel scale, some box layout put off the grid (`off_grid_count`) or
+    /// moved since the flush that would note it (`dirty`). Most frames of
+    /// most windows have neither, and pay this alone.
+    #[inline]
+    fn snap_needed(&self) -> bool {
+        self.pixel_scale > 0. && self.off_grid_count > 0
+    }
+    /// `items` of a walk from `root` on whole device pixels (`snap_box`),
+    /// after it, where layout put them off the grid: the walk itself is
+    /// as it was, so one without a pixel scale pays nothing for this.
+    #[inline(never)]
+    fn snap_items(&self, root: Option<NodeId>, items: &mut [PaintItem<'_>]) {
+        if !self.walk_snaps(root) {
+            return;
+        }
+        // Items share their clips, most in runs: the last one's, snapped.
+        let mut last = SnappedClip::NONE;
+        for item in items {
+            self.snap_item(item.id, &mut item.bounds, &mut item.clip, &mut last);
+        }
+    }
+    /// An item's box (`snapped_bounds`) and its clip on whole device
+    /// pixels, its clip by the same rule (each edge to the pixels whose
+    /// centres it holds), as a scroll's copy moves it (`resolve_moves`).
+    /// An item sharing nothing with its clip keeps both as laid out, as
+    /// main paints it: its clip snapped, a hairline beside it would show
+    /// inside, as would the box's own pixel each way. A walk leaves out
+    /// such an item only where its ink misses its clip, so the walks that
+    /// leave it out and those that keep it paint alike.
+    #[inline]
+    fn snap_item(
+        &self,
+        id: NodeId,
+        bounds: &mut Rect,
+        clip: &mut Option<Rect>,
+        last: &mut SnappedClip,
+    ) {
+        // A walk's ids are of nodes it just reached, and a kept frame's of
+        // nodes its tree holds: its slot, read without a generation check
+        // (none at all would leave it as it is: `snap_items_entry` can't
+        // unwind).
+        let Some(node) = self
+            .slots
+            .get(id.index as usize)
+            .and_then(|slot| slot.node.as_ref())
+        else {
+            return;
+        };
+        // Its bit is `note_off_grid`'s, as the layout that placed it left
+        // it: one gone stale would leave a box between pixels unsnapped,
+        // silently.
+        #[cfg(debug_assertions)]
+        assert_eq!(
+            node.boxed & OFF_GRID != 0,
+            self.off_grid(node.bounds),
+            "off_grid stale for {:?} at {}",
+            node.bounds,
+            self.pixel_scale
+        );
+        let moves = node.boxed & OFF_GRID != 0;
+        let clip_moves = match *clip {
+            Some(laid) => last.moves(laid, self.pixel_scale),
+            None => false,
+        };
+        // On the grid, under a clip on it: as laid out (most items).
+        if !moves && !clip_moves {
+            return;
+        }
+        if clip.is_some_and(|laid| !bounds.intersects(laid)) {
+            return;
+        }
+        if clip_moves {
+            *clip = Some(last.snapped);
+        }
+        if moves {
+            *bounds = self.snapped_bounds(node, *bounds);
+        }
+    }
+    /// Whether a kept frame's item (`item_in`, `box_in`) is snapped: as
+    /// the walk that recorded it was (`walk_snaps`), its ancestors being
+    /// the walk's root's.
+    fn kept_snaps(&self, id: NodeId) -> bool {
+        self.snap_needed() && self.walk_snaps(Some(id))
+    }
+    /// `node`'s box `shown` (its layout box moved by its translations),
+    /// off the grid or perhaps off it, as a walk that snaps paints it: its
+    /// layout box's edges on whole device pixels, each on its own (Blink's
+    /// pixel snapping), its translations added after, so a box moving
+    /// between pixels (an animation in flight) moves smoothly. Text keeps
+    /// its box (it lays its lines out to its width, and lands on pixels
+    /// itself), as do canvases, surfaces and transformed nodes.
+    fn snapped_bounds(&self, node: &Node, shown: Rect) -> Rect {
+        if node.transformed()
+            || !matches!(
+                node.kind,
+                NodeKind::Rect(_)
+                    | NodeKind::Quad(_)
+                    | NodeKind::Panel { .. }
+                    | NodeKind::Image(_)
+                    | NodeKind::Container(_)
+            )
+        {
+            return shown;
+        }
+        let snapped = snap_flagged(node.bounds, self.pixel_scale);
+        #[cfg(debug_assertions)]
+        assert_eq!(snapped, snap_box(node.bounds, self.pixel_scale));
+        if snapped == node.bounds {
+            return shown;
+        }
+        // Its translations, as the walk added them.
+        let (dx, dy) = (shown.x - node.bounds.x, shown.y - node.bounds.y);
+        Rect::new(
+            snapped.x + dx,
+            snapped.y + dy,
+            snapped.width,
+            snapped.height,
+        )
+    }
+    /// A kept frame's item (`item_in`) on whole device pixels, as the walk
+    /// that recorded it put its boxes (`snap_items`). A renderer calls it
+    /// where it calls `item_in`, behind `pixel_scale() > 0.`, so `item_in`
+    /// stays as it was. Plumbing for zgx-gpu, not a stable API.
+    #[doc(hidden)]
+    pub fn snap_kept_item(&self, item: &mut PaintItem<'_>) {
+        snap_kept_entry(self, item.id, &mut item.bounds, &mut item.clip);
+    }
+    /// `snap_kept_item` for `box_in`'s box, from what it `inherited`.
+    /// Plumbing for zgx-gpu, not a stable API.
+    #[doc(hidden)]
+    pub fn snap_kept_box(&self, id: NodeId, bounds: &mut Rect, inherited: &Inherited) {
+        snap_kept_entry(self, id, bounds, &mut inherited.clip.clone());
+    }
     /// Plain node `id`'s box as [`Scene::item_in`] places it, from what it
     /// `inherited`, and what it paints: for a renderer patching a node
     /// layout alone moved, whose item is otherwise as it was. Plumbing for
@@ -16915,7 +17307,33 @@ impl Scene {
     /// `from`: a subtree alone, from what its root inherited (`root` and
     /// `damage` are then `None`).
     /// `AROUND`: what `around` holds is left out, its own items kept.
+    #[inline(always)]
     fn layer_items_walk<
+        const POPUPS: bool,
+        const RECORD: bool,
+        const CLIPS: bool,
+        const AROUND: bool,
+        const LONG: bool,
+    >(
+        &self,
+        root: Option<NodeId>,
+        damage: Option<&[Rect]>,
+        inherited: &mut Vec<Inherited>,
+        from: Option<(NodeId, &Inherited)>,
+        around: Option<NodeId>,
+    ) -> Vec<PaintItem<'_>> {
+        let mut items = self.layer_items_walk_body::<POPUPS, RECORD, CLIPS, AROUND, LONG>(
+            root, damage, inherited, from, around,
+        );
+        // Its boxes on whole device pixels (`snap_items`), after it, so the
+        // walk is compiled as though it had none. A call alone here, its
+        // test inside: the renderers that inline this were reshaped by
+        // anything more (their drops went out of line).
+        snap_items_entry(self, root, from.map(|(id, _)| id), &mut items);
+        items
+    }
+    /// `layer_items_walk`'s walk.
+    fn layer_items_walk_body<
         const POPUPS: bool,
         const RECORD: bool,
         const CLIPS: bool,
@@ -16945,7 +17363,8 @@ impl Scene {
                 return false;
             };
             let ink = ink.translated(transform);
-            ink.intersects(reach) && damage.iter().any(|d| d.intersects(ink))
+            // One rect (a scroll's frame, most): `reach` is it.
+            ink.intersects(reach) && (damage.len() == 1 || damage.iter().any(|d| d.intersects(ink)))
         };
         // Whether ink (its parent's space, at `transform`) shows within
         // `clip`: children of a layer are walked in its own space, so a
@@ -16965,6 +17384,9 @@ impl Scene {
         }
         if self.kept_any.get() {
             self.walk_starts(start);
+        }
+        if let Some((id, _)) = from {
+            self.node(id);
         }
         let mut transform = Transform::default();
         let mut parent = self.node(start).parent;
@@ -17012,7 +17434,9 @@ impl Scene {
             stack.pop()
         {
             self.visit(id);
-            let node = self.node(id);
+            // `start` and `from` looked up checked before the walk; the rest
+            // its children, reached through the tree.
+            let node = self.tree_node(id);
             let is_root = root == Some(id);
             // A popup window draws it (`set_popup`).
             if POPUPS && !is_root && self.popups.contains(&id) {
@@ -17240,7 +17664,7 @@ impl Scene {
                         // reaches it through a splice of an ancestor that
                         // changed (`Scene::ink_may_show`).
                         .filter(|child| {
-                            let ink = self.ink(**child);
+                            let ink = self.child_ink(**child);
                             touches(ink, transform) && (!CLIPS || within(ink, transform, clip))
                         })
                         .map(|child| {
@@ -17366,6 +17790,310 @@ struct ResourceChanges {
     read: std::cell::Cell<bool>,
     dropping: bool,
 }
+/// A kept frame's item (`Scene::item_in`, `Scene::box_in`) snapped as
+/// its walk's were (`Scene::kept_snaps`), reached as `snap_items_entry`
+/// is and for the same reason: out of line and, in a release build,
+/// unable to unwind, so the renderers that inline its callers keep their
+/// shape. It panics on nothing in a release build, as `snap_items_entry`
+/// doesn't (`Scene::walk_snaps` looks nodes up with `node_if`).
+#[cfg(not(debug_assertions))]
+#[allow(improper_ctypes_definitions)]
+#[inline(never)]
+extern "C" fn snap_kept_entry(
+    scene: &Scene,
+    id: NodeId,
+    bounds: &mut Rect,
+    clip: &mut Option<Rect>,
+) {
+    if scene.kept_snaps(id) {
+        scene.snap_item(id, bounds, clip, &mut SnappedClip::fresh());
+    }
+}
+/// `snap_kept_entry`, unwinding, in a debug build.
+#[cfg(debug_assertions)]
+#[inline(never)]
+fn snap_kept_entry(scene: &Scene, id: NodeId, bounds: &mut Rect, clip: &mut Option<Rect>) {
+    if scene.kept_snaps(id) {
+        scene.snap_item(id, bounds, clip, &mut SnappedClip::fresh());
+    }
+}
+/// The last clip a snapping pass met (`Scene::snap_item`), by its bits,
+/// with the same on whole device pixels and whether that moves it: the
+/// next item under that clip, as most are, compares sixteen bytes.
+struct SnappedClip {
+    laid: [u32; 4],
+    snapped: Rect,
+    moves: bool,
+}
+impl SnappedClip {
+    /// None yet: no clip's bits are a NaN's with its sign and payload.
+    const NONE: Self = Self {
+        laid: [u32::MAX; 4],
+        snapped: Rect {
+            x: 0.,
+            y: 0.,
+            width: 0.,
+            height: 0.,
+        },
+        moves: false,
+    };
+    /// `NONE`, to fill in.
+    fn fresh() -> Self {
+        Self::NONE
+    }
+    /// Whether `laid`, snapped at `scale` (into `snapped`), moves.
+    #[inline]
+    fn moves(&mut self, laid: Rect, scale: f32) -> bool {
+        if !rect_has_bits(laid, &self.laid) {
+            self.laid = [laid.x, laid.y, laid.width, laid.height].map(f32::to_bits);
+            self.snapped = snap_flagged(laid, scale);
+            self.moves = self.snapped != laid;
+        }
+        self.moves
+    }
+}
+/// Whether `rect`'s bits are `bits`, as one sixteen-byte compare: every
+/// item of a snapping pass asks it (`SnappedClip::moves`).
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn rect_has_bits(rect: Rect, bits: &[u32; 4]) -> bool {
+    use core::arch::x86_64::*;
+    // SAFETY: SSE2 is x86-64's baseline; `[u32; 4]` is a `__m128i`'s 16
+    // bytes, every bit pattern of each valid.
+    unsafe {
+        let laid = _mm_castps_si128(_mm_setr_ps(rect.x, rect.y, rect.width, rect.height));
+        let held = core::mem::transmute::<[u32; 4], __m128i>(*bits);
+        _mm_movemask_epi8(_mm_cmpeq_epi32(laid, held)) == 0xFFFF
+    }
+}
+/// `rect_has_bits` with NEON.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn rect_has_bits(rect: Rect, bits: &[u32; 4]) -> bool {
+    use core::arch::aarch64::*;
+    // SAFETY: NEON is AArch64's baseline; four `f32`s and four `u32`s are
+    // a vector's 16 bytes, every bit pattern of each valid.
+    unsafe {
+        let laid =
+            core::mem::transmute::<[f32; 4], uint32x4_t>([rect.x, rect.y, rect.width, rect.height]);
+        let held = core::mem::transmute::<[u32; 4], uint32x4_t>(*bits);
+        vminvq_u32(vceqq_u32(laid, held)) == u32::MAX
+    }
+}
+/// `rect_has_bits` a lane at a time, where no vector is the baseline.
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[inline(always)]
+fn rect_has_bits(rect: Rect, bits: &[u32; 4]) -> bool {
+    [rect.x, rect.y, rect.width, rect.height].map(f32::to_bits) == *bits
+}
+/// `Scene::snap_items`, as every walk's callers reach it: in a release
+/// build through an `extern "C"` function, which can't unwind (a panic
+/// in it aborts), so they have no path dropping what they hold should it
+/// panic. With one, their drops were outlined and walks without a pixel
+/// scale paid for it. A debug build unwinds, so a check failing in it
+/// fails its test as any other.
+///
+/// Nothing it reaches panics in a release build, so it never aborts:
+/// nodes are looked up with `slots.get` and `Scene::node_if` (an id the
+/// scene doesn't hold is left as it is), not `node` or `tree_node`;
+/// `SnappedClip` compares bits; `snap_flagged`
+/// indexes `[_; 4]` arrays by constants and adds with `saturating_add`;
+/// its other steps are float arithmetic and comparisons, `Option` maps
+/// and a slice's iterator; it allocates nothing; and its checks are
+/// `cfg(debug_assertions)`. What can panic stays outside it.
+#[cfg(not(debug_assertions))]
+#[allow(improper_ctypes_definitions)]
+#[inline(never)]
+extern "C" fn snap_items_entry(
+    scene: &Scene,
+    root: Option<NodeId>,
+    from: Option<NodeId>,
+    items: &mut [PaintItem<'_>],
+) {
+    if scene.snap_needed() {
+        scene.snap_items(from.or(root), items);
+    }
+}
+/// `snap_items_entry`, unwinding, in a debug build.
+#[cfg(debug_assertions)]
+#[inline(never)]
+fn snap_items_entry(
+    scene: &Scene,
+    root: Option<NodeId>,
+    from: Option<NodeId>,
+    items: &mut [PaintItem<'_>],
+) {
+    if scene.snap_needed() {
+        scene.snap_items(from.or(root), items);
+    }
+}
+/// `snap_box`, out of line, for a scroll's clip (`Scene::resolve_moves`).
+#[inline(never)]
+fn snap_clip(rect: Rect, scale: f32) -> Rect {
+    snap_box(rect, scale)
+}
+/// `rect`'s edges on whole device pixels at `scale`, each on its own (boxes
+/// sharing an edge share it still): the pixels painted are those whose
+/// centres lie in `rect`, so a press on any of them hits it (an edge half
+/// a pixel in rounds inward, `ceil(v - 0.5)`). A box with any size keeps a
+/// pixel each way.
+fn snap_box(rect: Rect, scale: f32) -> Rect {
+    // `ceil` without a call: x86-64's baseline has no rounding instruction.
+    // Truncation is `ceil` for what's at or below zero; above it, one up
+    // unless already whole.
+    #[inline(always)]
+    fn ceil(at: f32) -> i32 {
+        let whole = at as i32;
+        whole + i32::from((whole as f32) < at)
+    }
+    // An edge's device pixel, and whether it lies on it already: such an
+    // edge keeps its own value, as a pixel's multiple at a scale like 2.2
+    // comes back an ulp off it (a GPU view's layer then missed its box).
+    // Past what an `i32` holds (or not a number), as it is.
+    #[inline(always)]
+    fn edge(value: f32, scale: f32) -> (i32, bool) {
+        let at = value * scale;
+        if at.is_nan() || at.abs() >= 2e9 {
+            return (0, true);
+        }
+        let pixel = ceil(at - 0.5);
+        (pixel, (at - pixel as f32).abs() < 1e-3)
+    }
+    let (right, bottom) = (rect.x + rect.width, rect.y + rect.height);
+    let ((x0, x0_on), (y0, y0_on)) = (edge(rect.x, scale), edge(rect.y, scale));
+    let ((mut x1, mut x1_on), (mut y1, mut y1_on)) = (edge(right, scale), edge(bottom, scale));
+    if rect.width > 0. && x1 <= x0 && !(x0_on && x1_on) {
+        (x1, x1_on) = (x0 + 1, false);
+    }
+    if rect.height > 0. && y1 <= y0 && !(y0_on && y1_on) {
+        (y1, y1_on) = (y0 + 1, false);
+    }
+    if x0_on && y0_on && x1_on && y1_on {
+        return rect;
+    }
+    let at = |value: f32, pixel: i32, on: bool| if on { value } else { pixel as f32 / scale };
+    let (left, top) = (at(rect.x, x0, x0_on), at(rect.y, y0, y0_on));
+    let (right, bottom) = (at(right, x1, x1_on), at(bottom, y1, y1_on));
+    Rect::new(left, top, right - left, bottom - top)
+}
+/// `snap_box` for a box layout put off the grid (`OFF_GRID`), the four
+/// edges as one vector: what every walk pays per such box. Bit for bit
+/// `snap_box`'s, an edge on its pixel already keeping its value.
+#[inline]
+fn snap_flagged(rect: Rect, scale: f32) -> Rect {
+    let (right, bottom) = (rect.x + rect.width, rect.y + rect.height);
+    let edges = [rect.x, rect.y, right, bottom];
+    // Each edge's device pixel, and the edge as painted.
+    let (pixels, at, on) = snap_edges(edges, scale);
+    if on == [true; 4] {
+        return rect;
+    }
+    let [left, top, mut right, mut bottom] = at;
+    // A box with any size keeps a pixel each way (rare: a sliver).
+    if rect.width > 0. && pixels[2] <= pixels[0] && !(on[0] && on[2]) {
+        right = pixels[0].saturating_add(1) as f32 / scale;
+    }
+    if rect.height > 0. && pixels[3] <= pixels[1] && !(on[1] && on[3]) {
+        bottom = pixels[1].saturating_add(1) as f32 / scale;
+    }
+    Rect::new(left, top, right - left, bottom - top)
+}
+/// `edges` at `scale`: each one's device pixel, `ceil(v * scale - 0.5)`;
+/// the edge as painted, that pixel back in points, or the edge as it is
+/// where it lies on its pixel already (or past an `i32`, or not a
+/// number); and which kept theirs. SSE2 and NEON are each target's
+/// baseline.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn snap_edges(edges: [f32; 4], scale: f32) -> ([i32; 4], [f32; 4], [bool; 4]) {
+    use core::arch::x86_64::*;
+    // SAFETY: SSE2 is x86-64's baseline: every x86-64 processor has it.
+    // The lane transmutes below are between 16-byte types every bit
+    // pattern of which is valid.
+    unsafe {
+        let value = _mm_setr_ps(edges[0], edges[1], edges[2], edges[3]);
+        let scale = _mm_set1_ps(scale);
+        let at = _mm_mul_ps(value, scale);
+        let centre = _mm_sub_ps(at, _mm_set1_ps(0.5));
+        // `ceil`: truncated, one up where that fell below (a mask is -1).
+        let whole = _mm_cvttps_epi32(centre);
+        let below = _mm_cmplt_ps(_mm_cvtepi32_ps(whole), centre);
+        let pixel = _mm_sub_epi32(whole, _mm_castps_si128(below));
+        let pixel_at = _mm_cvtepi32_ps(pixel);
+        let unsigned = |v| _mm_andnot_ps(_mm_set1_ps(-0.), v);
+        let on = _mm_cmplt_ps(unsigned(_mm_sub_ps(at, pixel_at)), _mm_set1_ps(1e-3));
+        // Past an `i32`, or not a number (no comparison holds for it).
+        let wild = _mm_cmpnlt_ps(unsigned(at), _mm_set1_ps(2e9));
+        let keep = _mm_or_ps(on, wild);
+        let snapped = _mm_div_ps(pixel_at, scale);
+        let out = _mm_or_ps(_mm_and_ps(keep, value), _mm_andnot_ps(keep, snapped));
+        let kept = _mm_movemask_ps(keep);
+        // Pixel 0 where there's none, as `snap_box` has it.
+        let pixel = _mm_andnot_si128(_mm_castps_si128(wild), pixel);
+        // `__m128i` and `__m128` are 16 bytes, as four `i32`s and four
+        // `f32`s are, every bit pattern of each valid.
+        let (pixels, out) = (
+            core::mem::transmute::<__m128i, [i32; 4]>(pixel),
+            core::mem::transmute::<__m128, [f32; 4]>(out),
+        );
+        (
+            pixels,
+            out,
+            [0, 1, 2, 3].map(|lane| kept & (1 << lane) != 0),
+        )
+    }
+}
+/// `snap_edges` with NEON.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn snap_edges(edges: [f32; 4], scale: f32) -> ([i32; 4], [f32; 4], [bool; 4]) {
+    use core::arch::aarch64::*;
+    // SAFETY: NEON is AArch64's baseline: every AArch64 processor has it.
+    // The lane transmutes below are between 16-byte types every bit
+    // pattern of which is valid.
+    unsafe {
+        // Four `f32`s are a `float32x4_t`'s 16 bytes.
+        let value = core::mem::transmute::<[f32; 4], float32x4_t>(edges);
+        let scale = vdupq_n_f32(scale);
+        let at = vmulq_f32(value, scale);
+        let pixel_at = vrndpq_f32(vsubq_f32(at, vdupq_n_f32(0.5)));
+        let on = vcltq_f32(vabdq_f32(at, pixel_at), vdupq_n_f32(1e-3));
+        // Past an `i32`, or not a number (no comparison holds for it).
+        let tame = vcltq_f32(vabsq_f32(at), vdupq_n_f32(2e9));
+        let keep = vorrq_u32(on, vmvnq_u32(tame));
+        let out = vbslq_f32(keep, value, vdivq_f32(pixel_at, scale));
+        // Pixel 0 where there's none, as `snap_box` has it.
+        let pixel = vbicq_s32(
+            vcvtq_s32_f32(pixel_at),
+            vreinterpretq_s32_u32(vmvnq_u32(tame)),
+        );
+        // 16 bytes each way, every bit pattern valid.
+        let (pixels, out, keep) = (
+            core::mem::transmute::<int32x4_t, [i32; 4]>(pixel),
+            core::mem::transmute::<float32x4_t, [f32; 4]>(out),
+            core::mem::transmute::<uint32x4_t, [u32; 4]>(keep),
+        );
+        (pixels, out, keep.map(|lane| lane != 0))
+    }
+}
+/// `snap_edges` a lane at a time, where no vector is the baseline.
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[inline(always)]
+fn snap_edges(edges: [f32; 4], scale: f32) -> ([i32; 4], [f32; 4], [bool; 4]) {
+    let (mut pixels, mut out, mut on) = ([0; 4], edges, [true; 4]);
+    for lane in 0..4 {
+        let at = edges[lane] * scale;
+        if at.is_nan() || at.abs() >= 2e9 {
+            continue;
+        }
+        let pixel = (at - 0.5).ceil();
+        pixels[lane] = pixel as i32;
+        if (at - pixel).abs() >= 1e-3 {
+            (out[lane], on[lane]) = (pixel / scale, false);
+        }
+    }
+    (pixels, out, on)
+}
 /// The most nodes noted as maybe painting otherwise (`PlainLook::unplain`) that
 /// `paints_plainly` looks through before it walks instead.
 const UNPLAIN_LOOKED_AT: usize = 64;
@@ -17375,11 +18103,18 @@ fn image_with_effect(kind: &NodeKind) -> bool {
 }
 /// Whether `style` fades any edge (`fade_mask` makes a mask of its own).
 fn fades(style: &Style) -> bool {
-    style
-        .fade_edges
-        .iter()
-        .chain(&style.fade_edges_x)
-        .any(|band| band.is_finite() && *band > 0.)
+    // No band's bits set (+0.0 each, nearly every style): none fades,
+    // without the loop below.
+    (style.fade_edges[0].to_bits()
+        | style.fade_edges[1].to_bits()
+        | style.fade_edges_x[0].to_bits()
+        | style.fade_edges_x[1].to_bits())
+        != 0
+        && style
+            .fade_edges
+            .iter()
+            .chain(&style.fade_edges_x)
+            .any(|band| band.is_finite() && *band > 0.)
 }
 /// The mask a node passes to its children: its own when it fades its edges
 /// (over its clip, less `fade_insets`), otherwise the one it inherited.
@@ -17664,6 +18399,126 @@ impl<'a> Iterator for PaintIter<'a> {
 
 #[cfg(test)]
 mod tests {
+    /// `snap_box` rounds each edge as `ceil(v * scale - 0.5)` would, without
+    /// the call: below zero, at halves, on whole pixels, at 1x and 2x.
+    #[test]
+    fn snapped_edges_are_ceil_of_the_pixel_centres() {
+        use super::{Rect, snap_box};
+        for scale in [1f32, 2., 1.5] {
+            for i in -400..400 {
+                let at = i as f32 / 8. + 0.03 * (i % 3) as f32;
+                let rect = snap_box(Rect::new(at, -at, 10., 10.), scale);
+                // Device pixels: at 1.5x a step's multiple and a division
+                // may part in the last bit.
+                let want = |v: f32| (v * scale - 0.5).ceil();
+                let pixel = |v: f32| (v * scale).round();
+                assert_eq!(pixel(rect.x), want(at), "{scale} x {at}");
+                assert_eq!(pixel(rect.y), want(-at), "{scale} y {at}");
+                let right = pixel(rect.x + rect.width);
+                assert_eq!(right, want(at + 10.), "{scale} right {at}");
+            }
+        }
+        // A sliver keeps a pixel.
+        let sliver = snap_box(Rect::new(3.6, 0., 0.2, 1.), 1.);
+        assert_eq!((sliver.x, sliver.width), (4., 1.));
+    }
+    /// A box layout moves after the flush that noted it off the grid, and
+    /// paints before the next (a layout outside a flush, as a host's frame
+    /// may run), is rounded as it is now, not as it was noted: on the grid
+    /// now, it paints as laid out.
+    #[test]
+    fn a_box_moved_since_its_flush_paints_as_it_is_now() {
+        use super::*;
+        let mut scene = Scene::new(100., 100.);
+        scene.set_pixel_scale(1.);
+        let root = scene.root();
+        let sized = |width: f32| Style {
+            width: Some(width),
+            height: Some(20.),
+            ..Default::default()
+        };
+        let panel = scene.append(
+            root,
+            NodeKind::Panel {
+                layout: Layout::Overlay,
+                quad: QuadStyle {
+                    fill: Color(0, 0, 0, 255),
+                    ..Default::default()
+                },
+            },
+            sized(10.),
+        );
+        scene.prepare_layout();
+        scene.flush();
+        assert!(
+            scene.node(panel).boxed & OFF_GRID == 0,
+            "10 wide is on the grid"
+        );
+        // As a renderer's walk paints it (`layer_items`).
+        let width = |scene: &Scene| {
+            scene
+                .layer_items(None)
+                .into_iter()
+                .find(|item| item.id == panel)
+                .map(|item| item.bounds.width)
+        };
+        assert_eq!(width(&scene), Some(10.));
+        // Off the grid now, laid out but not yet flushed: its bit, noted on
+        // the grid, would paint it 10.5 wide, between pixels. Its right edge
+        // is on the pixel whose centre it holds: 10.
+        scene.set_style(panel, sized(10.5));
+        scene.prepare_layout();
+        assert_eq!(width(&scene), Some(10.));
+        // And so after the flush that notes it.
+        scene.flush();
+        assert!(scene.node(panel).boxed & OFF_GRID != 0);
+        assert_eq!(width(&scene), Some(10.));
+    }
+    /// The vector rounding of an off-grid box is `snap_box`'s, bit for bit:
+    /// edges between pixels and on them, slivers, at whole and other
+    /// scales, and past an `i32`.
+    #[test]
+    fn four_edges_at_once_round_as_one_at_a_time() {
+        use super::{Rect, snap_box, snap_flagged};
+        for scale in [1f32, 2., 3., 1.25, 1.5, 1.8, 2.2] {
+            for i in -300..300 {
+                let at = i as f32 / 7. + 0.013 * (i % 5) as f32;
+                for (width, height) in [(10., 20.), (0.2, 0.3), (0., 4.25), (26.625, 68.)] {
+                    let rect = Rect::new(at, 32. - at / 3., width, height);
+                    let want = snap_box(rect, scale);
+                    assert_eq!(snap_flagged(rect, scale), want, "{scale} {rect:?}");
+                }
+            }
+        }
+        let huge = Rect::new(-1e12, 3.5, 2e12, 10.25);
+        assert_eq!(snap_flagged(huge, 2.), snap_box(huge, 2.));
+    }
+    /// A box on the grid already comes back as it is, bit for bit, at
+    /// scales whose pixels aren't whole points (2.2x: 88 pixels by `1/2.2`
+    /// is 39.999996, not 40, and a GPU view's layer then missed its box).
+    #[test]
+    fn a_box_on_the_grid_is_left_as_it_is() {
+        use super::{Rect, snap_box};
+        for scale in [2.2f32, 1.8, 1.5, 1.25, 1., 2., 3.] {
+            for points in [0f32, 30., 40., 120., 181.818_18, 222.222_22] {
+                // Whole points, and whole pixels between them.
+                for at in [points, (points * scale).round() / scale] {
+                    if ((at * scale) - (at * scale).round()).abs() >= 1e-3 {
+                        continue;
+                    }
+                    let rect = Rect::new(at, at, 10., 20.);
+                    let right = rect.x + rect.width;
+                    if ((right * scale) - (right * scale).round()).abs() >= 1e-3 {
+                        continue;
+                    }
+                    assert_eq!(snap_box(rect, scale), rect, "{scale} at {at}");
+                }
+            }
+        }
+        // Past an `i32`'s pixels, as it is.
+        let huge = Rect::new(-1e12, -1e12, 2e12, 2e12);
+        assert_eq!(snap_box(huge, 2.), huge);
+    }
     /// `given_size` reads the width and height `style` gives: a plain node's,
     /// one laid out otherwise than given (right to left), and a contents
     /// node's own.
@@ -21143,6 +21998,186 @@ mod tests {
         assert!(ids.iter().any(|id| id.index == reused.index));
         assert!(ids.iter().all(|id| !scene.contains(*id)));
         scene.flush();
+    }
+    /// A page taken out whole (`kill`, as a chat's transcript is when
+    /// another is opened) repaints what it showed, not the whole window: the
+    /// sidebar beside its card stays as it was. Every pixel taking it out
+    /// node by node (`remove`) repaints is repainted (its shadows, a panel's
+    /// paint past its clip, a backdrop blur, rows running under the card's
+    /// clip), as the page stands plain, under a scroll's translation, a
+    /// content blur's spread and a scaled layer; under a hidden parent,
+    /// nothing is.
+    #[test]
+    fn a_killed_page_repaints_what_it_showed_alone() {
+        #[derive(Clone, Copy, Debug, PartialEq)]
+        enum Round {
+            Plain,
+            Scrolled,
+            Blurred,
+            Scaled,
+            Hidden,
+        }
+        let boxed = |w: f32, h: f32, clip: bool| Style {
+            width: Some(w),
+            height: Some(h),
+            clip,
+            ..Style::default()
+        };
+        // A 400 × 300 window: a sidebar at its left, a card clipping a page
+        // (a box, a clipping panel with a shadow over an overflowing child, a
+        // backdrop blur and a column of rows running past the card's foot)
+        // at its right. Then the page taken out, by `kill` or by `remove`.
+        let run = |round: Round, kill: bool| -> (Vec<Rect>, Rect, Rect) {
+            let mut scene = Scene::new(400., 300.);
+            let root = scene.root();
+            scene.set_kind(root, NodeKind::Container(Layout::Overlay));
+            let sidebar = scene.append(
+                root,
+                NodeKind::Rect(Color(30, 30, 30, 255)),
+                boxed(100., 300., false),
+            );
+            let card = scene.append(
+                root,
+                NodeKind::Container(Layout::Overlay),
+                boxed(280., 280., true),
+            );
+            scene.set_transform(card, Transform { x: 110., y: 10. });
+            let holder = scene.append(
+                card,
+                NodeKind::Container(Layout::Column),
+                boxed(280., 600., false),
+            );
+            match round {
+                Round::Plain => {}
+                Round::Scrolled => scene.set_transform(holder, Transform { x: 0., y: -40. }),
+                Round::Blurred => scene.set_filter_blur(holder, 3.),
+                Round::Scaled => scene.set_local_transform(
+                    holder,
+                    LocalTransform {
+                        scale: (0.5, 0.5),
+                        origin: (0., 0.),
+                        ..LocalTransform::IDENTITY
+                    },
+                ),
+                Round::Hidden => scene.set_style(
+                    holder,
+                    Style {
+                        layout_options: Some(Arc::new(crate::layout::LayoutOptions {
+                            visible: Some(false),
+                            ..Default::default()
+                        })),
+                        ..boxed(280., 600., false)
+                    },
+                ),
+            }
+            let page = scene.append(
+                holder,
+                NodeKind::Container(Layout::Column),
+                boxed(200., 500., false),
+            );
+            scene.set_transform(page, Transform { x: 30., y: 20. });
+            scene.append(
+                page,
+                NodeKind::Rect(Color(200, 9, 9, 255)),
+                boxed(120., 20., false),
+            );
+            let panel = scene.append(
+                page,
+                NodeKind::Panel {
+                    layout: Layout::Overlay,
+                    quad: QuadStyle {
+                        fill: Color(9, 200, 9, 255),
+                        radius: 6.,
+                        shadow: Some(BoxShadow {
+                            color: Color(0, 0, 0, 128),
+                            offset: Transform { x: 3., y: 5. },
+                            blur_radius: 6.,
+                            spread: 1.,
+                        }),
+                        ..Default::default()
+                    },
+                },
+                boxed(100., 40., true),
+            );
+            scene.append(
+                panel,
+                NodeKind::Rect(Color(9, 9, 200, 255)),
+                boxed(160., 70., false),
+            );
+            let frost = scene.append(
+                page,
+                NodeKind::Container(Layout::Overlay),
+                boxed(90., 30., false),
+            );
+            scene.set_effects(
+                frost,
+                Effects {
+                    opacity: 1.,
+                    blur_radius: 8.,
+                    ..Effects::default()
+                },
+            );
+            let column = scene.append(
+                page,
+                NodeKind::Container(Layout::Column),
+                boxed(130., 400., false),
+            );
+            for n in 0..16 {
+                scene.append(
+                    column,
+                    NodeKind::Quad(QuadStyle {
+                        fill: Color(n * 15, 90, 90, 255),
+                        border_color: Color(255, 255, 255, 255),
+                        border_width: 1.,
+                        ..Default::default()
+                    }),
+                    boxed(110., 22., false),
+                );
+            }
+            scene.flush();
+            let sidebar_at = scene.world(sidebar).0;
+            let card_at = scene.world(card).0;
+            match kill {
+                true => drop(scene.kill(page)),
+                false => scene.remove(page),
+            }
+            (scene.flush().damage, sidebar_at, card_at)
+        };
+        for round in [
+            Round::Plain,
+            Round::Scrolled,
+            Round::Blurred,
+            Round::Scaled,
+            Round::Hidden,
+        ] {
+            let (killed, sidebar, card) = run(round, true);
+            let (removed, _, _) = run(round, false);
+            if round == Round::Hidden {
+                assert!(killed.is_empty(), "{round:?}: {killed:?}");
+                assert!(removed.is_empty(), "{round:?}: {removed:?}");
+                continue;
+            }
+            assert!(!removed.is_empty(), "{round:?}: taken out, it repaints");
+            let whole = killed.iter().copied().reduce(Rect::union).unwrap();
+            // What it showed, all of it.
+            for rect in &removed {
+                assert_eq!(
+                    rect.intersection(whole),
+                    Some(*rect),
+                    "{round:?}: {rect:?}, repainted taking it out node by node, isn't in {killed:?}"
+                );
+            }
+            // In its card: the sidebar stays as it was.
+            assert!(
+                !whole.intersects(sidebar),
+                "{round:?}: {killed:?} repaints the sidebar at {sidebar:?}"
+            );
+            assert_eq!(
+                whole.intersection(card),
+                Some(whole),
+                "{round:?}: {killed:?} runs past its card at {card:?}"
+            );
+        }
     }
     #[test]
     fn a_box_on_frosted_glass_is_plain_and_under_a_filter_is_not() {

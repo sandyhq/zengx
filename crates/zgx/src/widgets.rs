@@ -590,7 +590,23 @@ pub struct AtomEvent<'a> {
     pub reason: &'a str,
     text: &'a str,
 }
-impl AtomEvent<'_> {
+impl<'a> AtomEvent<'a> {
+    /// What happened to atoms over `text` (a text area's on another target,
+    /// the DOM's): `changes`, all of them as they are, and why.
+    #[doc(hidden)]
+    pub fn new(
+        changes: &'a [crate::text_edit::AtomChange],
+        atoms: &'a [crate::text_edit::Atom],
+        reason: &'a str,
+        text: &'a str,
+    ) -> Self {
+        Self {
+            changes,
+            atoms,
+            reason,
+            text,
+        }
+    }
     /// Byte offset `byte` of the text as it is now, in characters.
     pub fn chars(&self, byte: usize) -> usize {
         let mut at = byte.min(self.text.len());
@@ -654,6 +670,9 @@ struct CodeHint {
     /// set_caret_edges`), made when the app first sets them; most text
     /// areas never do.
     edge: std::cell::OnceCell<Box<crate::editor_edge::EdgeHint>>,
+    /// Its gap cursor (`EditorHandle::set_gaps`), made when the app first
+    /// sets or listens to one; most text areas never do.
+    gap: std::cell::OnceCell<Box<crate::editor_gap::GapHint>>,
 }
 /// What a text area's atoms need (`CodeHint::atoms`).
 #[derive(Default)]
@@ -802,6 +821,13 @@ impl EditorHint {
     /// Its edges' state, if the app ever set them.
     fn edge(&self) -> Option<&crate::editor_edge::EdgeHint> {
         self.code()?.edge.get().map(|edge| &**edge)
+    }
+    /// Its gap cursor's state, if the app ever set one.
+    fn gap(&self) -> Option<&crate::editor_gap::GapHint> {
+        self.code()?.gap.get().map(|gap| &**gap)
+    }
+    fn gap_made(&self) -> &crate::editor_gap::GapHint {
+        self.code_made().gap.get_or_init(Default::default)
     }
     /// Its long text's line cache, made the first time it is needed.
     fn line_cache(&self) -> Rc<crate::editor_lines::LineCache> {
@@ -1031,6 +1057,42 @@ pub enum CaretSide {
     /// Just inside it.
     Inside,
 }
+/// How the caret comes to a gap (`EditorHandle::set_gaps`): by which arrow,
+/// or a press on its boundary.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GapDir {
+    /// ← at the start of the line after it.
+    Left,
+    /// → at the end of the line before it.
+    Right,
+    /// ↑ from the first row of the line after it.
+    Up,
+    /// ↓ from the last row of the line before it.
+    Down,
+    /// A press within a few points of its boundary: no direction, the app
+    /// decides (true for every `GapDir` keeps a press going in wherever an
+    /// arrow may).
+    Press,
+}
+/// What was typed with the caret at a gap (`EditorHandle::on_gap_input`):
+/// nothing of it went into the text, for the app to add a paragraph there.
+#[doc(hidden)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum GapInput {
+    /// Text typed (or committed by an input method).
+    Text(String),
+    /// Return.
+    Enter,
+    /// Backspace (`backward`) or forward Delete.
+    Delete {
+        /// Backspace.
+        backward: bool,
+    },
+    /// Text pasted.
+    Paste(String),
+}
 impl EditorHandle {
     /// The spans whose edges the caret tells apart (a note's inline code):
     /// `edges(offset)` gives the span the offset is in or at an end of. At
@@ -1062,6 +1124,52 @@ impl EditorHandle {
             edge.side.set(side);
             self.refresh();
         }
+    }
+    /// Where the caret may sit between lines rather than in one (a gap
+    /// cursor): `gaps(n, dir)` says whether before line `n` (`n` the line
+    /// count: after the last) is such a place for the caret coming as `dir`
+    /// says (so ← and → may go into a gap beside an atom block that ↑ and ↓
+    /// pass, selecting the atom as the web does), where no text is to put a caret in
+    /// (between two tables, an image and a rule, before a table at the
+    /// start). The arrows go into such a boundary from the line beside it,
+    /// as does a press on it; there the caret shows as a short bar along it,
+    /// and what is typed goes to `on_gap_input`, not into the text. `None`:
+    /// none (the caret leaves the one it is in).
+    #[doc(hidden)]
+    pub fn set_gaps(&self, gaps: Option<Rc<dyn Fn(usize, GapDir) -> bool>>) {
+        let gap = self.hint.gap_made();
+        let none = gaps.is_none();
+        *gap.gaps.borrow_mut() = gaps;
+        if none {
+            gap.go(None);
+        }
+        self.refresh();
+    }
+    /// Put the caret at the gap before line `at` (`None`: back in the text,
+    /// where its selection is), whether or not `set_gaps` allows it there.
+    #[doc(hidden)]
+    pub fn set_gap(&self, at: Option<usize>) {
+        self.hint.gap_made().go(at);
+        self.refresh();
+    }
+    /// The gap the caret is at, if it is at one.
+    #[doc(hidden)]
+    pub fn gap(&self) -> Option<usize> {
+        self.hint.gap().and_then(|gap| gap.at.get())
+    }
+    /// Call `told` when the caret goes into a gap (`Some(line)`: before
+    /// that line) or out of one (`None`), by the arrows, a press or the app.
+    #[doc(hidden)]
+    pub fn on_gap(&self, told: impl FnMut(Option<usize>) + 'static) {
+        *self.hint.gap_made().on_gap.borrow_mut() = Some(Box::new(told));
+    }
+    /// Call `told` with what is typed while the caret is at a gap (the gap's
+    /// line, and what), which doesn't go into the text: the app adds a
+    /// paragraph there and puts the caret in it (`set_gap(None)`,
+    /// `set_selection`).
+    #[doc(hidden)]
+    pub fn on_gap_input(&self, told: impl FnMut(usize, GapInput) + 'static) {
+        *self.hint.gap_made().on_input.borrow_mut() = Some(Box::new(told));
     }
     /// Exact natural metrics at a finite, positive content width. A reactive
     /// reader follows content, IME and typography changes after layout settles.
@@ -1282,6 +1390,9 @@ impl EditorHandle {
     fn select(&self, anchor: usize, focus: usize, reveal: bool) {
         if let Some(edge) = self.hint.edge() {
             edge.side.set(CaretSide::Outside);
+        }
+        if let Some(gap) = self.hint.gap() {
+            gap.go(None);
         }
         let focus = {
             let mut editor = self.editor.borrow_mut();
@@ -1774,17 +1885,13 @@ impl EditorHandle {
     /// Whether the clipboard took it. (Pin line.)
     #[doc(hidden)]
     pub fn copy_to_clipboard(&self, ui: &Ui, platform: &crate::platform::PlatformService) -> bool {
-        ui.copy_from(self, false, |text, html| {
-            write_clipboard(platform, text, html)
-        })
+        ui.copy_from(self, false, |content| write_clipboard(platform, content))
     }
     /// Cut the selection to `platform`'s clipboard as the person would
     /// (`Ui::copy_from`). Whether the clipboard took it. (Pin line.)
     #[doc(hidden)]
     pub fn cut_to_clipboard(&self, ui: &Ui, platform: &crate::platform::PlatformService) -> bool {
-        ui.copy_from(self, true, |text, html| {
-            write_clipboard(platform, text, html)
-        })
+        ui.copy_from(self, true, |content| write_clipboard(platform, content))
     }
     /// Replace the selection with `text`, as typed: what a text service
     /// (Windows' emoji panel, dictation, touch keyboard) inserts. A
@@ -1887,6 +1994,15 @@ impl EditorHandle {
         if self.is_read_only() {
             return;
         }
+        if let Some(gap) = self.hint.gap()
+            && let Some(at) = gap.at.get()
+        {
+            gap.input(
+                at,
+                GapInput::Paste(normalize_text(text, self.multiline).into_owned()),
+            );
+            return;
+        }
         self.preferred_x.set(None);
         // A step of its own, even of one character: not the typing's.
         self.editor
@@ -1948,13 +2064,41 @@ pub enum EditCommand {
     /// Select all the text there is to select.
     SelectAll,
 }
-/// What goes on the clipboard: text, and HTML beside it where given.
-/// (Pin line.)
+/// What goes on the clipboard: text, and HTML beside it where given, and
+/// types of the app's own beside them. (Pin line.)
 #[doc(hidden)]
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ClipboardContent {
     pub text: String,
     pub html: Option<String>,
+    /// MIME types of the app's own and their text
+    /// (`Platform::set_clipboard_typed`), in one change with the text and
+    /// HTML; none writes them as ever.
+    pub types: Vec<(String, String)>,
+}
+impl ClipboardContent {
+    /// `text`, with `html` beside it where given, and no types.
+    #[doc(hidden)]
+    pub fn new(text: String, html: Option<String>) -> Self {
+        Self {
+            text,
+            html,
+            types: Vec::new(),
+        }
+    }
+    /// Put it on `platform`'s clipboard: its types, where it has some, in
+    /// one change with the text and HTML; else the text, and the HTML
+    /// beside it, as ever. Whether the clipboard took it.
+    #[doc(hidden)]
+    pub fn write(self, platform: &dyn crate::platform::Platform) -> bool {
+        if !self.types.is_empty() {
+            return platform.set_clipboard_typed(self.text, self.html, &self.types);
+        }
+        match self.html {
+            Some(html) => platform.set_clipboard_rich_text(self.text, html),
+            None => platform.set_clipboard_text(self.text),
+        }
+    }
 }
 /// What `View::on_copy` gives an editor: what goes on the clipboard for a
 /// copy or a cut, or none for the selection's plain text.
@@ -1989,16 +2133,12 @@ pub struct SelectedRows {
 /// What `View::on_selection_copy` gives a region: what goes on the
 /// clipboard, or none for the selection's own text and HTML.
 pub(crate) type SelectionCopyHook = Rc<dyn Fn(&SelectionCopyRequest) -> Option<ClipboardContent>>;
-/// `text` on `platform`'s clipboard, with `html` beside it where given.
+/// `content` on `platform`'s clipboard (`ClipboardContent::write`).
 pub(crate) fn write_clipboard(
     platform: &crate::platform::PlatformService,
-    text: String,
-    html: Option<String>,
+    content: ClipboardContent,
 ) -> bool {
-    match html {
-        Some(html) => platform.0.set_clipboard_rich_text(text, html),
-        None => platform.0.set_clipboard_text(text),
-    }
+    content.write(&*platform.0)
 }
 /// The layout and notification passes a frame takes to settle.
 const LAYOUT_PASSES: usize = 64;
@@ -2033,6 +2173,16 @@ impl Drop for FramePreparationGuard<'_> {
     fn drop(&mut self) {
         self.0.set(false);
     }
+}
+
+/// An open popup: where its window is, in window coordinates, and what it is.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[doc(hidden)]
+pub struct PopupInfo {
+    /// Its window's rectangle.
+    pub rect: Rect,
+    /// A menu, a popover or a tooltip, if it says.
+    pub role: Option<crate::scene::PopupRole>,
 }
 
 /// One retained document. Application code keeps returned node IDs as stable widget handles.
@@ -2126,6 +2276,184 @@ fn long_layout(
         scene.text_shaper_revision(),
         || (scene.line_shaper(size, font), scene.rich_line_shaper()),
     )
+}
+/// Where the boundary before line `n` of `text` lies in `layout`: the top
+/// of that line, or the bottom of the last for `n` past it.
+fn gap_boundary_y(layout: &dyn TextLayout, text: &str, n: usize) -> f32 {
+    match crate::editor_gap::line_start(text, n) {
+        Some(start) => {
+            layout
+                .caret_position(TextPosition {
+                    byte_offset: start,
+                    affinity: TextAffinity::After,
+                })
+                .y
+        }
+        None => {
+            let end = layout.caret_position(TextPosition {
+                byte_offset: text.len(),
+                affinity: TextAffinity::Before,
+            });
+            end.y + end.height
+        }
+    }
+}
+/// What a text area's gap cursor does with `event` (`EditorHandle::set_gaps`):
+/// the caret at a gap takes the arrows out of it and what is typed (to the
+/// app); the arrows or a press beside a boundary the app allows take it in.
+/// True if the event was its. `layout` lays the text out; `point` turns a
+/// press's point into the text's.
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn gap_event(
+    gap: &crate::editor_gap::GapHint,
+    event: &InputEvent,
+    editor: &RefCell<TextEditor>,
+    position: &Cell<TextPosition>,
+    layout: &dyn Fn(&TextEditor) -> Rc<dyn TextLayout>,
+    point: &dyn Fn(f32, f32) -> (f32, f32),
+    single_press: bool,
+) -> bool {
+    use crate::editor_gap::{line_end, line_of, line_start};
+    let at = gap.at.get();
+    match event {
+        InputEvent::KeyDown { key, modifiers, .. } => {
+            let arrow = matches!(
+                key,
+                Key::ArrowLeft | Key::ArrowRight | Key::ArrowUp | Key::ArrowDown
+            );
+            let back = matches!(key, Key::ArrowLeft | Key::ArrowUp);
+            if let Some(n) = at {
+                match key {
+                    // Out, to the text beside it; at the text's very start or
+                    // end it stays.
+                    _ if arrow => {
+                        let to = {
+                            let e = editor.borrow();
+                            let text = e.text();
+                            match back {
+                                true => n.checked_sub(1).and_then(|m| line_end(&text, m)),
+                                false => line_start(&text, n),
+                            }
+                        };
+                        if let Some(to) = to {
+                            let focus = {
+                                let mut e = editor.borrow_mut();
+                                e.set_selection(to, to);
+                                e.selection().focus
+                            };
+                            position.set(TextPosition {
+                                byte_offset: focus,
+                                affinity: TextAffinity::After,
+                            });
+                            gap.go(None);
+                        }
+                    }
+                    Key::Enter => gap.input(n, GapInput::Enter),
+                    Key::Backspace => gap.input(n, GapInput::Delete { backward: true }),
+                    Key::Delete => gap.input(n, GapInput::Delete { backward: false }),
+                    // Moving by more leaves the gap, from the caret it had.
+                    Key::Home | Key::End | Key::PageUp | Key::PageDown => {
+                        gap.go(None);
+                        return false;
+                    }
+                    _ => return false,
+                }
+                return true;
+            }
+            if !arrow || modifiers.shift || modifiers.meta || modifiers.control || modifiers.alt {
+                return false;
+            }
+            // In, from the edge of the line beside the boundary.
+            let target = {
+                let e = editor.borrow();
+                let selection = e.selection();
+                if !selection.range().is_empty() {
+                    return false;
+                }
+                let (text, focus) = (e.text(), selection.focus);
+                let line = line_of(&text, focus);
+                let (Some(start), Some(end)) = (line_start(&text, line), line_end(&text, line))
+                else {
+                    return false;
+                };
+                match key {
+                    Key::ArrowLeft => (focus == start).then_some((line, GapDir::Left)),
+                    Key::ArrowRight => (focus == end).then_some((line + 1, GapDir::Right)),
+                    _ => {
+                        // Up from its first row, down from its last.
+                        let layout = layout(&e);
+                        let shown = position.get();
+                        let current = match shown.byte_offset == focus {
+                            true => shown,
+                            false => TextPosition {
+                                byte_offset: focus,
+                                affinity: TextAffinity::After,
+                            },
+                        };
+                        let edge = TextPosition {
+                            byte_offset: if back { start } else { end },
+                            affinity: if back {
+                                TextAffinity::After
+                            } else {
+                                TextAffinity::Before
+                            },
+                        };
+                        let row = |p| layout.caret_position(p).y;
+                        ((row(current) - row(edge)).abs() < 0.5).then_some(if back {
+                            (line, GapDir::Up)
+                        } else {
+                            (line + 1, GapDir::Down)
+                        })
+                    }
+                }
+            };
+            match target {
+                Some((n, dir)) if gap.allows(n, dir) => {
+                    gap.go(Some(n));
+                    true
+                }
+                _ => false,
+            }
+        }
+        InputEvent::Text(text) | InputEvent::ImeCommit(text) => match at {
+            Some(n) => {
+                gap.input(n, GapInput::Text(text.clone()));
+                true
+            }
+            None => false,
+        },
+        InputEvent::PointerDown {
+            x,
+            y,
+            button: PointerButton::Primary,
+        } => {
+            // A press on a boundary the app allows (a line's top or bottom,
+            // within a few points): the caret goes into its gap.
+            let pressed = single_press.then(|| {
+                let (x, y) = point(*x, *y);
+                let e = editor.borrow();
+                let layout = layout(&e);
+                let text = e.text();
+                let line = line_of(&text, layout.hit_position(x, y).byte_offset);
+                [line, line + 1].into_iter().find(|&n| {
+                    (y - gap_boundary_y(&*layout, &text, n)).abs() <= crate::editor_gap::PRESS_SLOP
+                })
+            });
+            match pressed.flatten() {
+                Some(n) if gap.allows(n, GapDir::Press) => {
+                    gap.go(Some(n));
+                    true
+                }
+                _ => {
+                    gap.go(None);
+                    false
+                }
+            }
+        }
+        _ => false,
+    }
 }
 /// `e`'s committed text laid out (`editor_layout`): a long one by its
 /// lines, from the chunks it shares, known by its revision (a pointer's
@@ -2342,6 +2670,8 @@ pub(crate) struct UiStorage {
     /// Open signals of anchored popups, by their popup roots
     /// (`Ui::dismiss_popups`).
     popups: RefCell<Vec<(NodeId, Signal<bool>)>>,
+    /// What each of those is (`register_popup`).
+    popup_kinds: RefCell<Vec<(NodeId, crate::scene::PopupRole)>>,
     /// Portals' owners and overlays, in the order they mounted (`Ui::portals`).
     portals: RefCell<Vec<(NodeId, NodeId)>>,
     /// The context menu opened last: the node it took the focus from, and
@@ -2434,6 +2764,9 @@ pub(crate) struct UiStorage {
     scroll_padding: RefCell<crate::scene::NodeMap<crate::scene::Insets>>,
     /// Run once after the next frame preparation's layout.
     after_layout: RefCell<Vec<Box<dyn FnOnce()>>>,
+    /// The open popups' windows, once something observes them
+    /// (`Ui::observe_popups`).
+    popups_observed: RefCell<Option<Signal<Vec<PopupInfo>>>>,
     /// Run after every layout pass that changes the layout, by owning node.
     layout_listeners: RefCell<crate::scene::NodeMap<Vec<LayoutListener>>>,
     /// Boxes views' container queries read (`View::container`).
@@ -2776,6 +3109,7 @@ impl Ui {
             popup_limits: runtime.signal(Vec::new()),
             popup_flips: runtime.signal(Vec::new()),
             popups: RefCell::new(Vec::new()),
+            popup_kinds: RefCell::new(Vec::new()),
             portals: RefCell::new(Vec::new()),
             context_menu: RefCell::new(None),
             popup_soon: RefCell::new(None),
@@ -2820,6 +3154,7 @@ impl Ui {
             margins_checked: Cell::new(0),
             scroll_padding: RefCell::default(),
             after_layout: RefCell::new(Vec::new()),
+            popups_observed: RefCell::default(),
             layout_listeners: RefCell::default(),
             containers: RefCell::default(),
             mount_initialization: RefCell::new(None),
@@ -3026,6 +3361,7 @@ impl Ui {
     }
     /// Run `f` now and whenever what it reads changes, for as long as `owner`
     /// is mounted.
+    #[track_caller]
     pub fn bind(&mut self, owner: NodeId, f: impl FnMut() + 'static) {
         self.bind_marked(owner, false, f);
     }
@@ -3033,6 +3369,8 @@ impl Ui {
     /// deferred input draws need not be made before it runs
     /// (`watch_geometry`).
     #[inline]
+    // Traced builds name a binding by where in zgx it was made.
+    #[cfg_attr(feature = "trace", track_caller)]
     pub(crate) fn bind_marked(
         &mut self,
         owner: NodeId,
@@ -3078,12 +3416,25 @@ impl Ui {
     }
     /// `bind_marked`'s effect, kept by `owner`: apart, so what is generic
     /// over the callback stays small enough to inline where it is built.
+    #[cfg_attr(feature = "trace", track_caller)]
     fn add_binding(&mut self, owner: NodeId, mount_pure: bool, callback: Rc<RefCell<dyn FnMut()>>) {
+        // Read here: a closure below is no `track_caller` function.
+        #[cfg(feature = "trace")]
+        let at = std::panic::Location::caller();
         self.runtime.clone().batch(|| {
             let effect = self.runtime.effect_callback(mount_pure, callback);
             #[cfg(feature = "trace")]
             if crate::trace::enabled() {
-                crate::trace::name(effect.number(), format!("@{} binding", owner.number()));
+                // Where in zgx the binding was made says which prop or feature it is.
+                crate::trace::name(
+                    effect.number(),
+                    format!(
+                        "@{} binding {}:{}",
+                        owner.number(),
+                        at.file().rsplit('/').next().unwrap_or(at.file()),
+                        at.line()
+                    ),
+                );
             }
             self.storage
                 .owned
@@ -3096,6 +3447,7 @@ impl Ui {
     }
     /// [`Ui::bind`] for a text input's model or typography: `mount_pure`,
     /// as it reads no geometry before its draw lays out (`watch_geometry`).
+    #[cfg_attr(feature = "trace", track_caller)]
     pub(crate) fn bind_input(&mut self, owner: NodeId, f: impl FnMut() + 'static) {
         self.bind_marked(owner, true, f);
         INPUT_DRAWS.with_borrow_mut(|draws| {
@@ -3701,8 +4053,52 @@ impl Ui {
             .or_default()
             .push(Rc::new(RefCell::new(f)));
     }
+    fn popup_infos(&self) -> Vec<PopupInfo> {
+        let scene = self.scene.borrow();
+        let kinds = self.storage.popup_kinds.borrow();
+        self.storage
+            .popups
+            .borrow()
+            .iter()
+            .filter(|(root, open)| scene.contains(*root) && open.with_untracked(|open| *open))
+            .map(|(root, _)| PopupInfo {
+                rect: scene.transformed_bounds(*root),
+                role: kinds
+                    .iter()
+                    .find(|(node, _)| node == root)
+                    .map(|(_, role)| *role),
+            })
+            .collect()
+    }
+    /// The open popups' windows, menus, popovers and tooltips, in window
+    /// coordinates, as of the last layout.
+    #[doc(hidden)]
+    pub fn observe_popups(&self) -> Signal<Vec<PopupInfo>> {
+        let existing = self.storage.popups_observed.borrow().clone();
+        existing.unwrap_or_else(|| {
+            let signal = self.signal(self.popup_infos());
+            *self.storage.popups_observed.borrow_mut() = Some(signal.clone());
+            signal
+        })
+    }
+    /// Out of line: only an app that reads `ui.window.popups` observes them,
+    /// and every layout of the others passes by.
+    #[cold]
+    #[inline(never)]
+    fn publish_popups(&self) {
+        let Some(signal) = self.storage.popups_observed.borrow().clone() else {
+            return;
+        };
+        let now = self.popup_infos();
+        if signal.with_untracked(|was| *was != now) {
+            signal.set(now);
+        }
+    }
     /// Whether any after-layout work ran.
     fn run_after_layout(&self) -> bool {
+        if self.storage.popups_observed.borrow().is_some() {
+            self.publish_popups();
+        }
         let pending = std::mem::take(&mut *self.storage.after_layout.borrow_mut());
         if pending.is_empty() {
             return false;
@@ -4355,11 +4751,19 @@ impl Ui {
         });
         self.retain(node, binding);
     }
-    pub(crate) fn register_popup(&self, root: NodeId, open: Signal<bool>) {
+    pub(crate) fn register_popup(
+        &self,
+        root: NodeId,
+        open: Signal<bool>,
+        role: crate::scene::PopupRole,
+    ) {
         let scene = self.scene.borrow();
         let mut popups = self.storage.popups.borrow_mut();
         popups.retain(|(node, _)| scene.contains(*node));
         popups.push((root, open));
+        let mut kinds = self.storage.popup_kinds.borrow_mut();
+        kinds.retain(|(node, _)| scene.contains(*node));
+        kinds.push((root, role));
     }
     /// A context menu opening, showing while `shown` is
     /// (`compose_context_menu`): it takes the focus from what has it.
@@ -4518,7 +4922,7 @@ impl Ui {
     /// The person copied (or, with `cut`, cut) out of `editor` (a key, the
     /// Edit menu, its context menu, `EditorHandle::copy_to_clipboard`): its
     /// `View::on_copy` says what goes on the clipboard, else its selection's
-    /// text, and `write` puts it there (text, and HTML beside it). A
+    /// text, and `write` puts it there (text, HTML and types beside it). A
     /// password field gives nothing and asks no hook; nor does an empty
     /// selection. A cut the clipboard took deletes the selection, one undo
     /// step, unless the editor is read-only (a cut there is a copy).
@@ -4528,7 +4932,7 @@ impl Ui {
         &self,
         editor: &EditorHandle,
         cut: bool,
-        write: impl FnOnce(String, Option<String>) -> bool,
+        write: impl FnOnce(ClipboardContent) -> bool,
     ) -> bool {
         if editor.is_secure() {
             return false;
@@ -4548,12 +4952,10 @@ impl Ui {
             range,
             text: &text,
         };
-        let content = hook.and_then(|hook| hook(&request));
-        let (text, html) = match content {
-            Some(content) => (content.text, content.html),
-            None => (text, None),
-        };
-        if !write(text, html) {
+        let content = hook
+            .and_then(|hook| hook(&request))
+            .unwrap_or_else(|| ClipboardContent::new(text, None));
+        if !write(content) {
             return false;
         }
         if cut {
@@ -4599,10 +5001,7 @@ impl Ui {
         command: EditCommand,
         platform: &dyn crate::platform::Platform,
     ) -> bool {
-        let write = |text: String, html: Option<String>| match html {
-            Some(html) => platform.set_clipboard_rich_text(text, html),
-            None => platform.set_clipboard_text(text),
-        };
+        let write = |content: ClipboardContent| content.write(platform);
         if command == EditCommand::SelectAll {
             return self.select_all();
         }
@@ -6822,15 +7221,25 @@ impl Ui {
                     }
                 };
             let caret_rect = layout.caret_position(caret_position);
-            // A hair inside or outside a span's edge (`set_caret_edges`).
-            let cx = caret_rect.x
-                + match draw_hint.edge() {
-                    Some(edge) if selection.range().is_empty() && e.preedit().is_none() => {
-                        edge.nudge(display_cursor)
-                    }
-                    _ => 0.,
-                };
-            let cy = caret_rect.y;
+            // At a gap (`EditorHandle::set_gaps`): a short bar along it;
+            // else a hair inside or outside a span's edge (`set_caret_edges`).
+            let gap_at = draw_hint.gap().and_then(|gap| gap.at.get());
+            let (cx, cy) = match gap_at {
+                Some(n) => (
+                    0.,
+                    gap_boundary_y(&*layout, &e.text(), n) - crate::editor_gap::BAR_HEIGHT / 2.,
+                ),
+                None => (
+                    caret_rect.x
+                        + match draw_hint.edge() {
+                            Some(edge) if selection.range().is_empty() && e.preedit().is_none() => {
+                                edge.nudge(display_cursor)
+                            }
+                            _ => 0.,
+                        },
+                    caret_rect.y,
+                ),
+            };
             let line_height = caret_rect.height;
             let mut scroll = scroll_for_draw.borrow_mut();
             let reveal = !draw_hint.hold.replace(false) && draw_gesture.mode.get().is_none();
@@ -6911,7 +7320,13 @@ impl Ui {
                 .get()
                 .1
                 .unwrap_or_else(|| draw_caret_width.get());
-            s.set_style(caret, fixed(caret_width, line_height));
+            match gap_at {
+                Some(_) => s.set_style(
+                    caret,
+                    fixed(crate::editor_gap::BAR_WIDTH, crate::editor_gap::BAR_HEIGHT),
+                ),
+                None => s.set_style(caret, fixed(caret_width, line_height)),
+            }
             // Aligned, the text's box is its layout's width, which the text
             // aligns in as the layout does; its placeholder, the field's.
             let aligned_placeholder = factor > 0. && shown.is_some();
@@ -6933,13 +7348,19 @@ impl Ui {
             );
             text_style.text_wrap = draw_wrap.get();
             s.set_style(text, text_style);
-            s.set_transform(
-                text,
-                Transform {
-                    x: if aligned_placeholder { 0. } else { -scroll.0 },
-                    y: -scroll.1,
-                },
-            );
+            // A long text's node holds nothing (its lines show apart, in
+            // their layer): moved with each scroll, its box as tall as the
+            // text would repaint all the view shows. It stays, and is placed
+            // again once it shows text.
+            if !(long && shown.is_none()) {
+                s.set_transform(
+                    text,
+                    Transform {
+                        x: if aligned_placeholder { 0. } else { -scroll.0 },
+                        y: -scroll.1,
+                    },
+                );
+            }
             // A long text shows the lines in view, a text node each (by line
             // number: a scroll gives one node a new line, not each of them).
             let shown_lines = match &long_lines {
@@ -6971,6 +7392,12 @@ impl Ui {
                         .map_or(order.len(), |i| i + 1);
                     order.insert(at, layer);
                     s.reorder_children(viewport, &order);
+                    // Scroll content: the lines are placed in it where they
+                    // are in the text, and a scroll moves it alone, by whole
+                    // device pixels (the lines' glyphs snap to them anyway),
+                    // which the renderer copies, painting only what comes
+                    // into view.
+                    s.set_scroll_copy(layer, true);
                     code.line_layer.set(Some(layer));
                     pool.clear();
                 }
@@ -6980,6 +7407,16 @@ impl Ui {
                 let mut free: Vec<NodeId> = free.into_iter().map(|(_, id)| id).collect();
                 pool.extend(kept);
                 if let (Some(lines), Some(layer)) = (&long_lines, code.line_layer.get()) {
+                    // A jump of half the view or more (a page) leaves a copy
+                    // little to keep, and every line shown changes: the view
+                    // repaints whole, damaged first, so what each line damages
+                    // after is held by it at once.
+                    let at = s.transform(layer);
+                    if (scroll.1 + at.y).abs() * 2. >= inner_height
+                        || (scroll.0 + at.x).abs() * 2. >= inner_width
+                    {
+                        s.damage_shown(layer);
+                    }
                     for i in shown_lines.clone() {
                         if pool.iter().any(|(line, _)| *line == i) {
                             continue;
@@ -7055,11 +7492,18 @@ impl Ui {
                         s.set_transform(
                             *id,
                             Transform {
-                                x: -scroll.0,
-                                y: lines.top(*i) - scroll.1,
+                                x: 0.,
+                                y: lines.top(*i),
                             },
                         );
                     }
+                    s.set_transform(
+                        layer,
+                        Transform {
+                            x: -scroll.0,
+                            y: -scroll.1,
+                        },
+                    );
                 }
                 for id in free {
                     s.remove(id);
@@ -8140,6 +8584,33 @@ impl Ui {
                 if mutation { cx.prevent_default(); return; }
             }
             let event = cx.event.clone();
+            // The caret at a gap, or going into one (`EditorHandle::set_gaps`):
+            // only a text area whose app set gaps asks.
+            if let Some(gap) = hint.gap() {
+                let layout = |e: &TextEditor| {
+                    let s = scene.borrow();
+                    let (_, size, font) = typography.borrow().clone();
+                    committed_layout(&input_storage, &s, root, e, size,
+                        wrap.get().then_some(s.bounds(viewport).width.max(1.)), &font,
+                    )
+                };
+                let point = |x: f32, y: f32| {
+                    let s = scene.borrow();
+                    let bounds = s.bounds(viewport);
+                    let scroll = *scroll.borrow();
+                    let (x, y) = in_viewport(&s, viewport, x, y);
+                    (x - bounds.x + scroll.0, y - bounds.y + scroll.1)
+                };
+                let single = cx.click_count() == 1 && !cx.pointer_modifiers().shift;
+                if gap_event(gap, &event, &editor, &position, &layout, &point, single) {
+                    if matches!(event, InputEvent::PointerDown { .. }) {
+                        cx.capture_pointer();
+                    }
+                    cx.prevent_default();
+                    draw();
+                    return;
+                }
+            }
             if matches!(
                 event,
                 InputEvent::PointerDown { .. }
@@ -9206,7 +9677,11 @@ fn editor_word_segment(text: &str, index: usize) -> (usize, usize) {
     (start, end)
 }
 
-fn normalize_text(text: &str, multiline: bool) -> std::borrow::Cow<'_, str> {
+/// `text` as an editor takes it: `\r\n` and `\r` a line break, and in a
+/// single-line editor its lines joined (the DOM's text area with atoms
+/// takes what it is given so too).
+#[doc(hidden)]
+pub fn normalize_text(text: &str, multiline: bool) -> std::borrow::Cow<'_, str> {
     use std::borrow::Cow;
     if !holds(text, b'\r') && (multiline || !holds(text, b'\n')) {
         return Cow::Borrowed(text);

@@ -108,7 +108,7 @@ Plugin { name: "stamps".into(), entry, grants: vec![
 
 **A shortcut with no modifier** (`k`, `enter`, `f5`, or Shift alone on a character) would be taken from every field, page and terminal, so a plugin's takes `Capability::Named("zgx.command.bare_keys")`. Without it `ui.command { key = "k" }` is an error; one a state or function says is dropped as it reads so, reported in `host.dropped_shortcuts()`.
 
-**The app's own scripts under a guard.** `host.guard(|kind, name| …)` is asked before the app's VM leaves the interface, each time, and an `Err` stops it with that text as the script's error: for previewing someone's template in the app's own VM. Plugins aren't asked; they reach what their grants say.
+**The app's own scripts under a guard.** `host.guard(|kind, name| …)` is asked before the app's VM leaves the interface, each time, and an `Err` stops it with that text as the script's error: for previewing someone's template in the app's own VM. Plugins aren't asked; they reach what their grants say. `host.web_guard(|web, url| …)` (internal for now) is asked of pages in its place: each URL a script loads and each navigation the platform starts (a main frame's, an iframe's, a redirect's, on every backend), with the `ui.web` id the page was made under (`None` for an anonymous one), so the app's browser tabs can reach `http:` while its previews stay on HTTPS. Unset, `guard` decides of pages as before.
 
 | `GuardKind` | Asked before | `name` |
 | --- | --- | --- |
@@ -153,7 +153,7 @@ A plugin sees nothing of the app's own `ui.state`. What it reads and changes, th
   - `host.expose_shared_read("tasks", None)` lets them read it and follow it, but not change it. `get`, `peek`, `len`, `at`, templates (`{tasks}`), filters and a list's items read it. `set`, `update`, `push` and every other write from a plugin is an error naming the key, as is binding it where it is written (an input's `value`). The app's own scripts write it as before.
 
   Pass a capability instead of `None` to expose it to the plugins granted that capability only. The example shares its tasks read only: the focus plugin counts the open ones on its button and filters the list, but only the app and the host's actions change them. `focus` is the plugin's to set.
-- **Actions.** `host.action("complete", …)` is a Rust handler that scripts call with `ui.action("complete", id)` (as a handler) or `ui.invoke`. `host.expose_action("complete", None)` lets plugins call it too. The example exposes completing a task but not adding one or clearing what is done: those stay the app's.
+- **Actions.** `host.action("complete", …)` is a Rust handler that scripts call with `ui.action("complete", id)` (as a handler) or `ui.invoke`. `host.expose_action("complete", None)` lets plugins call it too. The example exposes completing a task but not adding one or clearing what is done: those stay the app's. A name registered twice keeps the later handler; in a debug build, a second registration from another place in the host's code warns (stderr, `ScriptHost::warnings`, the lint strip), naming both places. One from the same place (a host rebuilt) doesn't.
 - **Everything else** (fetching, the clipboard, files, windows, web views, terminals) takes its own capability; see the table in [scripting.md](scripting.md#plugins).
 
 ## Plugins in a Luau app: zgx.json

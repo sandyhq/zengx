@@ -84,6 +84,12 @@ export function zgx_init(baseCss, onDispatch, onFlush, onEvent, onKeys) {
   document.addEventListener("dragover", onOutsideOver, true);
   document.addEventListener("dragleave", onOutsideLeave, true);
   document.addEventListener("drop", onOutsideDrop, true);
+  // A contenteditable over a model (a text area with atoms): its edits are
+  // the model's.
+  document.addEventListener("beforeinput", onBeforeInput, true);
+  document.addEventListener("compositionstart", onCompositionStart, true);
+  document.addEventListener("compositionend", onCompositionEnd, true);
+  document.addEventListener("keydown", onEditKey, true);
 }
 
 // A link with no href (`role=link`): Enter presses it, as it does a link.
@@ -187,6 +193,7 @@ export function zgx_schedule() {
 }
 
 function onClick(event) {
+  if (offCount !== 0 && event.target.closest?.("[data-off]")) return;
   let node = event.target;
   while (node && node !== root) {
     const handler = node.$$c;
@@ -205,7 +212,80 @@ function onClick(event) {
   }
 }
 
+// Disabled elements (`OFF`) and what they hold, as a disabled fieldset's
+// controls are: no input or focus, heard disabled. Each control inside is
+// marked as the element is disabled (or as it is added, while it is),
+// keeping its own state in `$$off` to give back when no disabled element
+// holds it any more.
+let offCount = 0;
+const OFFABLE = "button,input,select,textarea,a[href],[tabindex],[contenteditable]";
+const NATIVE = /^(BUTTON|INPUT|SELECT|TEXTAREA)$/;
+
+function setOff(el, on) {
+  if (on === el.hasAttribute("data-off")) return;
+  if (on) {
+    offCount++;
+    el.setAttribute("data-off", "");
+    el.setAttribute("aria-disabled", "true");
+    for (const inside of el.querySelectorAll(OFFABLE)) offMark(inside);
+    el.$$offWatch = new MutationObserver((records) => {
+      for (const record of records)
+        for (const added of record.addedNodes) {
+          if (added.nodeType !== 1) continue;
+          if (added.matches(OFFABLE)) offMark(added);
+          for (const inside of added.querySelectorAll(OFFABLE)) offMark(inside);
+        }
+    });
+    el.$$offWatch.observe(el, { childList: true, subtree: true });
+  } else {
+    offCount--;
+    el.$$offWatch.disconnect();
+    el.$$offWatch = undefined;
+    el.removeAttribute("data-off");
+    // Still inside another disabled element: heard disabled through it.
+    if (el.$$off === undefined) el.removeAttribute("aria-disabled");
+    for (const inside of el.querySelectorAll(OFFABLE)) offRestore(inside);
+  }
+}
+
+function offMark(el) {
+  if (el.$$off !== undefined) return;
+  el.$$off = [el.disabled, el.getAttribute("tabindex"), el.getAttribute("aria-disabled"), el.getAttribute("contenteditable")];
+  if (NATIVE.test(el.tagName)) {
+    el.disabled = true;
+    return;
+  }
+  if (el.tagName === "A") el.setAttribute("tabindex", "-1");
+  else el.removeAttribute("tabindex");
+  if (el.hasAttribute("contenteditable")) el.setAttribute("contenteditable", "false");
+  el.setAttribute("aria-disabled", "true");
+}
+
+function offRestore(el) {
+  const was = el.$$off;
+  if (was === undefined || el.parentElement?.closest("[data-off]")) return;
+  el.$$off = undefined;
+  if (NATIVE.test(el.tagName)) {
+    el.disabled = was[0];
+    return;
+  }
+  const put = (name, value) => (value === null ? el.removeAttribute(name) : el.setAttribute(name, value));
+  put("tabindex", was[1]);
+  put("aria-disabled", el.hasAttribute("data-off") ? "true" : was[2]);
+  if (was[3] !== null) el.setAttribute("contenteditable", was[3]);
+}
+
 function onInput(event) {
+  // A contenteditable over a model the browser wrote into (`UNPREVENTED`),
+  // composing no more: shown again from the model.
+  const host = editHost(event.target);
+  if (host) {
+    if (host.$$dirty && host.$$cs === undefined) {
+      host.$$dirty = false;
+      sendEdit(host, "render", "", 0, 0);
+    }
+    return;
+  }
   const node = event.target;
   const handler = node.$$i;
   if (handler === undefined) return;
@@ -391,6 +471,7 @@ export function zgx_apply(memory, opsPtr, opsLen, strPtr, strLen) {
         else if (kind === 7) group(node, handler);
         else if (kind === 9) node.$$m = handler;
         else if (kind === 10) node.$$si = handler;
+        else if (kind === 11) node.$$e = handler;
         break;
       }
       case 15: { // VALUE id str: an editor's text, unless it holds it
@@ -423,7 +504,11 @@ export function zgx_apply(memory, opsPtr, opsLen, strPtr, strLen) {
       case 18: { // PROP id name on: a boolean property
         const node = nodes[ops[i++]];
         const name = str();
-        node[name] = ops[i++] === 1;
+        const on = ops[i++] === 1;
+        // A control inside a disabled element stays disabled: its own
+        // value waits for the element to be enabled (`offRestore`).
+        if (node.$$off !== undefined && name === "disabled") node.$$off[0] = on;
+        else node[name] = on;
         break;
       }
       case 19: { // CLONE id from: a template's copy
@@ -520,6 +605,18 @@ export function zgx_apply(memory, opsPtr, opsLen, strPtr, strLen) {
           panel.$$o.at = { x, y };
           if (panel.matches(":popover-open")) place(panel);
         }
+        break;
+      }
+      case 34: { // SELECT root anchor focus: a contenteditable's selection, in UTF-16 units
+        const el = nodes[ops[i++]];
+        const anchor = ops[i++];
+        const focus = ops[i++];
+        selectIn(el, anchor, focus);
+        break;
+      }
+      case 35: { // OFF id on: an element disabled, with what it holds
+        const el = nodes[ops[i++]];
+        setOff(el, ops[i++] === 1);
         break;
       }
       case 31: // PREVENT: the click being handled doesn't do its default
@@ -984,6 +1081,8 @@ function heard(event) {
 function run(node, event, phase) {
   const handler = node.$$e;
   if (handler === undefined) return;
+  // Inside a disabled element, as on the desktop: no input reaches it.
+  if (offCount !== 0 && event.target.closest?.("[data-off]")) return;
   const kind = EVENTS[event.type];
   const mods =
     (event.shiftKey ? 1 : 0) | (event.ctrlKey ? 2 : 0) | (event.altKey ? 4 : 0) | (event.metaKey ? 8 : 0);
@@ -1703,8 +1802,11 @@ function onContextMenu(event) {
 // The clipboard (`src/platform.rs`). A page reads it only inside a paste
 // event: reads give that paste's, else what the page last copied, cut,
 // pasted or wrote.
-let clipboard = { text: null, html: null };
+let clipboard = { text: null, html: null, types: [] };
 let pastePending = null;
+// The types a copy event in progress puts on the clipboard
+// (`zgx_clipboard_write_typed`), and whether it took them.
+let typedCopy = null;
 
 export function zgx_clipboard_text() {
   return clipboard.text;
@@ -1714,8 +1816,40 @@ export function zgx_clipboard_html() {
   return clipboard.html;
 }
 
+// The types of a page's own the clipboard holds as this page last read or
+// wrote them: names and values in turn.
+export function zgx_clipboard_types() {
+  return clipboard.types.flat();
+}
+
+export function zgx_clipboard_typed(mime) {
+  const found = clipboard.types.find(([kind]) => kind === mime);
+  return found ? found[1] : null;
+}
+
+// `text`, `html` and `types` (names and values in turn) in one copy: the
+// async Clipboard API takes no type of a page's own, so the page copies as
+// a person's ⌘C does (`execCommand`, within a click or a key's gesture),
+// setting each on the event's data, which the browser keeps where other
+// pages' pastes read them (Chromium's web custom data). Refused (no
+// gesture), the text and HTML go as `zgx_clipboard_write` writes them.
+export function zgx_clipboard_write_typed(text, html, types) {
+  const pairs = [];
+  for (let i = 0; i + 1 < types.length; i += 2) pairs.push([types[i], types[i + 1]]);
+  typedCopy = { text, html: html === undefined ? null : html, types: pairs, taken: false };
+  let copied = false;
+  try {
+    copied = document.execCommand("copy");
+  } catch (_) {}
+  const taken = copied && typedCopy.taken;
+  typedCopy = null;
+  if (!taken) return zgx_clipboard_write(text, html);
+  clipboard = { text, html: html === undefined ? null : html, types: pairs };
+  return true;
+}
+
 export function zgx_clipboard_write(text, html) {
-  clipboard = { text, html: html === undefined ? null : html };
+  clipboard = { text, html: html === undefined ? null : html, types: [] };
   const c = navigator.clipboard;
   if (!c) return false;
   const done = html != null && typeof ClipboardItem !== "undefined"
@@ -1741,6 +1875,154 @@ const encoder = new TextEncoder();
 // A field whose value has a selection (text, search, a textarea…).
 function selects(el) {
   return (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) && el.selectionStart !== null;
+}
+
+// A contenteditable over a model (`atom_editor.rs`): the element that takes
+// `target`'s edits, if it is in one.
+function editHost(target) {
+  let node = target;
+  while (node && node.$$e === undefined) node = node.parentNode;
+  return node || null;
+}
+
+// Where `node`'s `offset` is in `el`'s text, in UTF-16 units: its chips'
+// labels are its text.
+function textOffset(el, node, offset) {
+  const range = document.createRange();
+  range.setStart(el, 0);
+  range.setEnd(node, offset);
+  return range.toString().length;
+}
+
+// `el`'s selection in UTF-16 units of its text, in order.
+function editSelection(el) {
+  const selection = document.getSelection();
+  if (!selection || selection.rangeCount === 0 || !el.contains(selection.anchorNode)) {
+    const end = el.textContent.length;
+    return [end, end];
+  }
+  const range = selection.getRangeAt(0);
+  return [
+    textOffset(el, range.startContainer, range.startOffset),
+    textOffset(el, range.endContainer, range.endOffset),
+  ];
+}
+
+// A DOM point at `at` UTF-16 units into `el`'s text: never inside a chip
+// (contenteditable false), whose edges stand for it.
+function pointAt(el, at) {
+  const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+  let seen = 0;
+  for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+    const length = node.nodeValue.length;
+    const chip = node.parentNode !== el && node.parentNode.isContentEditable === false
+      ? node.parentNode
+      : null;
+    if (at <= seen + length) {
+      if (!chip) return [node, at - seen];
+      const index = Array.prototype.indexOf.call(chip.parentNode.childNodes, chip);
+      return at === seen ? [chip.parentNode, index] : [chip.parentNode, index + 1];
+    }
+    seen += length;
+  }
+  return [el, el.childNodes.length];
+}
+
+// `el`'s selection set from its model's (UTF-16 units), while it has the focus.
+function selectIn(el, anchor, focus) {
+  const active = document.activeElement;
+  if (active !== el && !el.contains(active)) return;
+  const selection = document.getSelection();
+  if (!selection) return;
+  const [anchorNode, anchorOffset] = pointAt(el, anchor);
+  const [focusNode, focusOffset] = pointAt(el, focus);
+  selection.setBaseAndExtent(anchorNode, anchorOffset, focusNode, focusOffset);
+}
+
+// An edit of `el` for its model: `kind` (an input type), `data`, over bytes
+// `start` to `end` of its text.
+function sendEdit(el, kind, data, start, end) {
+  // Both ends in one number, each below 2^26 (a text past 64 MiB keeps its
+  // ends there rather than mixing them).
+  const most = 67108863;
+  dispatch(el.$$e, 20, Math.min(start, most) * 67108864 + Math.min(end, most), kind + "\0" + data);
+}
+
+// Input types whose range is not at the caret: a spelling correction or a
+// text replacement, a drop, a drag's delete. Every other edit takes the
+// selection, and the model decides what a delete takes (a chip whole, its
+// own words and lines), as a native field does.
+const TARGETED = new Set(["insertReplacementText", "insertFromDrop", "deleteByDrag"]);
+
+// The edit's own range where it isn't the caret and the browser gives one,
+// else the selection: UTF-16 units of `el`'s text, in order.
+function editRange(el, event) {
+  const ranges = TARGETED.has(event.inputType) && event.getTargetRanges ? event.getTargetRanges() : [];
+  if (ranges.length) {
+    const range = ranges[0];
+    if (el.contains(range.startContainer) && el.contains(range.endContainer)) {
+      return [
+        textOffset(el, range.startContainer, range.startOffset),
+        textOffset(el, range.endContainer, range.endOffset),
+      ];
+    }
+  }
+  return editSelection(el);
+}
+
+// Input types the browser won't let be prevented: what it writes is the
+// model's at the composition's end, and the text is shown again whole
+// after it (`onInput`).
+const UNPREVENTED = new Set(["insertCompositionText", "deleteCompositionText", "insertFromComposition"]);
+
+function onBeforeInput(event) {
+  const el = editHost(event.target);
+  if (!el) return;
+  // An input method's text goes in as the browser shows it, its end to the
+  // model (`onCompositionEnd`).
+  if (UNPREVENTED.has(event.inputType) || event.isComposing) {
+    el.$$dirty = true;
+    return;
+  }
+  event.preventDefault();
+  const text = el.textContent;
+  const [start, end] = editRange(el, event);
+  let data = event.data;
+  // A paste or a drop: its plain text alone.
+  if (data == null && event.dataTransfer) data = event.dataTransfer.getData("text/plain");
+  sendEdit(el, event.inputType, data || "", utf8(text, start), utf8(text, end));
+}
+
+function onCompositionStart(event) {
+  const el = editHost(event.target);
+  if (!el) return;
+  const text = el.textContent;
+  const [start, end] = editSelection(el);
+  el.$$cs = [utf8(text, start), utf8(text, end)];
+  sendEdit(el, "compositionstart", "", el.$$cs[0], el.$$cs[1]);
+}
+
+function onCompositionEnd(event) {
+  const el = editHost(event.target);
+  if (!el) return;
+  const [start, end] = el.$$cs || [0, 0];
+  el.$$cs = undefined;
+  el.$$dirty = false;
+  sendEdit(el, "compositionend", event.data || "", start, end);
+}
+
+// Undo and redo by key in a contenteditable over a model: the model's, not
+// the browser's (which holds none of it).
+function onEditKey(event) {
+  const el = editHost(event.target);
+  if (!el || !(event.metaKey || event.ctrlKey) || event.altKey) return;
+  const key = event.key.toLowerCase();
+  const redo = (key === "z" && event.shiftKey) || (key === "y" && !event.shiftKey);
+  if (key !== "z" && !redo) return;
+  event.preventDefault();
+  const text = el.textContent;
+  const [start, end] = editSelection(el);
+  sendEdit(el, redo ? "historyRedo" : "historyUndo", "", utf8(text, start), utf8(text, end));
 }
 
 // UTF-16 offset `at` of `text` in UTF-8 bytes, as Rust counts it.
@@ -1849,18 +2131,35 @@ export function zgx_open_url(url) {
   return window.open(url, "_blank", "noopener,noreferrer") !== null || true;
 }
 
-function onCopy() {
+function onCopy(event) {
+  // A copy `zgx_clipboard_write_typed` made: what it writes, nothing else.
+  if (typedCopy && event.clipboardData) {
+    const data = event.clipboardData;
+    data.setData("text/plain", typedCopy.text);
+    if (typedCopy.html !== null) data.setData("text/html", typedCopy.html);
+    for (const [kind, value] of typedCopy.types) data.setData(kind, value);
+    typedCopy.taken = true;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    return;
+  }
   const selection = document.getSelection();
   const text = selection ? selection.toString() : "";
-  if (text) clipboard = { text, html: null };
+  if (text) clipboard = { text, html: null, types: [] };
 }
+
+// What a page's own types are among a paste's: those not the browser's.
+const standardTypes = new Set(["text/plain", "text/html", "text/uri-list", "Files"]);
 
 function onPaste(event) {
   const data = event.clipboardData;
   if (data) {
     const text = data.getData("text/plain");
     const html = data.getData("text/html");
-    clipboard = { text: text || null, html: html || null };
+    const types = Array.from(data.types)
+      .filter((kind) => !standardTypes.has(kind))
+      .map((kind) => [kind, data.getData(kind)]);
+    clipboard = { text: text || null, html: html || null, types };
   }
   // A paste a keymap waited for (`onKeymaps`): its actions run now.
   const pending = pastePending;

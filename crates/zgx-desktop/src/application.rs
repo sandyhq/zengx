@@ -33,6 +33,24 @@ use zgx::{
 };
 use zgx_gpu::{GpuContext, GpuRenderer};
 
+thread_local! {
+    /// Menu actions a window's keys chose (its shortcuts, bound in its input:
+    /// `bind_keys`) that nothing in the window took, in order, by window: the
+    /// app's to carry out. Carried out as soon as the window event that chose
+    /// them is handled (`WindowManager::window_event`), before the next; an
+    /// event posted to the loop (`Event::MenuFallback`) catches any chosen
+    /// outside a window event.
+    static MENU_FALLBACKS: RefCell<VecDeque<(u64, crate::MenuAction)>> = RefCell::default();
+}
+/// Native menu items chosen and not yet carried out, in order (macOS): AppKit
+/// calls muda's handler inside the dispatch of the key that chose one, and
+/// the event the handler posts to the loop (`Event::NativeMenuAction`) can
+/// arrive after input AppKit had queued behind that key. Every window event
+/// first carries these out (`WindowManager::window_event`).
+#[cfg(target_os = "macos")]
+static NATIVE_MENU_CHOSEN: std::sync::Mutex<VecDeque<crate::MenuAction>> =
+    std::sync::Mutex::new(VecDeque::new());
+
 /// How a window is made: its title, size, chrome and placement.
 #[derive(Clone, Debug)]
 pub struct WindowOptions {
@@ -119,6 +137,16 @@ pub struct WindowOptions {
     /// software one): the GPU's, or the raster always.
     #[doc(hidden)]
     pub renderer: Option<crate::RendererChoice>,
+    /// Where `Titlebar::Inset`'s traffic lights go on macOS: the close
+    /// button's top left, in the content's points from the window's top
+    /// left (Electron's `trafficLightPosition`), so they line up with a
+    /// title bar of the app's own height. They stay there as the window
+    /// resizes, changes focus or appearance and comes back from full
+    /// screen, and move with the window's zoom as the content does. `None`
+    /// (the default) is AppKit's place, centred in a 40-point strip. Other
+    /// platforms and title bars place their own.
+    #[doc(hidden)]
+    pub traffic_lights: Option<(f64, f64)>,
 }
 /// A window's smallest and largest sizes are the same.
 #[cfg(any(windows, test))]
@@ -158,6 +186,7 @@ impl Default for WindowOptions {
             visible: true,
             caption_height: None,
             renderer: None,
+            traffic_lights: None,
         }
     }
 }
@@ -167,7 +196,9 @@ enum Event {
     /// An event, with the token of the launch that sent it (Linux).
     Application(crate::ApplicationEvent, Option<String>),
     MenuAction(u64, crate::MenuAction),
-    MenuFallback(u64, crate::MenuAction),
+    /// Menu actions a window's keys chose and nothing in it took
+    /// (`MENU_FALLBACKS`): carry them out.
+    MenuFallback,
     MenusChanged,
     /// A font was replaced (`WindowFactory::replace_font`): every window's
     /// text shapes and draws again.
@@ -180,8 +211,9 @@ enum Event {
     /// The desktop's appearance settings changed (`linux_appearance`).
     #[cfg(target_os = "linux")]
     AppearanceChanged,
+    /// Native menu items were chosen (`NATIVE_MENU_CHOSEN`): carry them out.
     #[cfg(target_os = "macos")]
-    NativeMenuAction(crate::MenuAction),
+    NativeMenuAction,
     /// AppKit said a window goes into or out of full screen, or is there
     /// (`window_chrome::watch_full_screen`).
     #[cfg(target_os = "macos")]
@@ -1085,6 +1117,12 @@ impl Application {
     /// return once the application quits.
     pub fn run(self, build: impl FnOnce(&mut WindowContext)) -> Result<(), Box<dyn Error>> {
         zgx::profile::mark("run");
+        // `ZGX_FREEZE_TIME=1`: every animation, timer, caret and frame stands
+        // at one time until `zgx inspect clock advance` moves it, so a
+        // screenshot run is the same each time.
+        if zgx::env::var_os("ZGX_FREEZE_TIME").is_some_and(|v| !v.is_empty() && v != "0") {
+            zgx::clock::freeze();
+        }
         // Who the app is to the system's notifications and badge.
         crate::notify::set_identity(crate::notify::Identity {
             application_id: self.application_id.clone(),
@@ -1155,7 +1193,10 @@ impl Application {
         {
             let wake = proxy.clone();
             muda::MenuEvent::set_event_handler(Some(move |event: muda::MenuEvent| {
-                let _ = wake.send_event(Event::NativeMenuAction(crate::MenuAction(event.id.0)));
+                if let Ok(mut chosen) = NATIVE_MENU_CHOSEN.lock() {
+                    chosen.push_back(crate::MenuAction(event.id.0));
+                }
+                let _ = wake.send_event(Event::NativeMenuAction);
             }));
             // With none of the app's own, still the application and Window
             // menus every Mac app has: checked now, made once the first frame
@@ -1327,6 +1368,32 @@ const TRIM_DELAY: std::time::Duration = std::time::Duration::from_millis(1500);
 /// (`GpuRenderer::rest_queue`): idle that long, a queue starts as slowly as a
 /// new one, so the next frame pays no more for it than it would anyway.
 const QUEUE_REST_DELAY: std::time::Duration = std::time::Duration::from_secs(10);
+/// A wake whose first frame came to a queue given back at least
+/// `QUEUE_REST_DELAY` before (`rested`, when), with no input since: a lone
+/// wake (a clock's tick, an update from elsewhere). Its queue goes back at its
+/// trim, not `QUEUE_REST_DELAY` later: the next lone wake finds it cold
+/// either way, and Metal's driver holds ~200 MB for a queue while it's kept.
+/// A wake soon after another keeps the queue as before (its first frame comes
+/// to a queue given back less than `QUEUE_REST_DELAY` before).
+fn lone_wake(
+    rested: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> Option<std::time::Instant> {
+    rested.filter(|rested| now.saturating_duration_since(*rested) >= QUEUE_REST_DELAY)
+}
+/// Whether a lone wake (`lone_wake`'s `rested`) gives its queue back at its
+/// trim: not if input has acted since the queue rested (someone is here, and
+/// the next frame may follow soon).
+/// `ZGX_QUEUE_REST_LONE=0` keeps a lone wake's queue for `QUEUE_REST_DELAY`,
+/// as before (to compare).
+static QUEUE_REST_LONE: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| zgx::env::var_os("ZGX_QUEUE_REST_LONE").is_none_or(|v| v != "0"));
+fn queue_rests_at_trim(
+    lone: Option<std::time::Instant>,
+    acted_at: Option<std::time::Instant>,
+) -> bool {
+    lone.is_some_and(|rested| !acted_since(acted_at, Some(rested)))
+}
 /// A window idle this long past that gives back a glyph atlas it grew: what
 /// it costs is a slow first frame, for someone who has been away a while.
 const ATLAS_TRIM_DELAY: std::time::Duration = std::time::Duration::from_secs(30);
@@ -1382,8 +1449,8 @@ fn answers_input(acted_at: Option<std::time::Instant>, now: std::time::Instant) 
     acted_at.is_some_and(|at| now.saturating_duration_since(at) < INPUT_LIVE)
 }
 /// Whether input acted after the frame last shown (`shown`): the next draws
-/// at once, not at the refresh's tick (`Host::process`).
-#[cfg(target_os = "macos")]
+/// at once, not at the refresh's tick (`Host::process`). Also whether a lone
+/// wake's queue rests at its trim (`queue_rests_at_trim`), on every platform.
 fn acted_since(acted_at: Option<std::time::Instant>, shown: Option<std::time::Instant>) -> bool {
     acted_at.is_some_and(|at| shown.is_none_or(|shown| at > shown))
 }
@@ -2053,6 +2120,11 @@ struct Host {
     trim_stage: TrimStage,
     /// What's owed at rest after the trim (`TrimStage::Rest`).
     rest: Rest,
+    /// When this window last gave its GPU queue back, while no frame has used
+    /// it since (`lone_wake`).
+    queue_rested: Option<std::time::Instant>,
+    /// This wake is a lone one: when its queue had rested (`lone_wake`).
+    lone_wake: Option<std::time::Instant>,
     /// When to save the window's frame (`frame_autosave`, Linux): once its
     /// moves and resizes settle.
     frame_save_at: Option<std::time::Instant>,
@@ -2213,7 +2285,13 @@ impl Host {
                 && let Some(action) = action.downcast_ref::<crate::MenuAction>()
                 && crate::app_menu::enabled_action(&menus.borrow(), action)
             {
-                let _ = fallback.send_event(Event::MenuFallback(token, action.clone()));
+                // Carried out as soon as the event dispatching it is done
+                // (`WindowManager::window_event`), before the input after
+                // it: a key typed just after ⌘N is the new chat's. (Posted
+                // too, for an action dispatched outside a window event.)
+                MENU_FALLBACKS
+                    .with(|queued| queued.borrow_mut().push_back((token, action.clone())));
+                let _ = fallback.send_event(Event::MenuFallback);
                 event.prevent_default();
             }
         });
@@ -2513,6 +2591,8 @@ impl Host {
             trim_at: None,
             trim_stage: TrimStage::Trim,
             rest: Rest::none(),
+            queue_rested: None,
+            lone_wake: None,
             release_images_at: None,
             release_rows_at: None,
             frame_save_at: None,
@@ -2817,6 +2897,17 @@ impl Host {
         if phase.settles()
             && let Some(window) = &self.window
         {
+            // Out of full screen AppKit lays the traffic lights out in its
+            // own places again, as the inset toolbar shows.
+            let (zoom, traffic_lights) = (self.context.ui.zoom(), self.options.traffic_lights);
+            if zoom != 1. || traffic_lights.is_some() {
+                crate::window_chrome::place_buttons(
+                    window,
+                    self.options.titlebar,
+                    zoom,
+                    traffic_lights,
+                );
+            }
             info.refresh(window, self.options.titlebar);
             // Covered after all, once the transition is over: an occlusion
             // it went on drawing through is counted now.
@@ -3517,6 +3608,11 @@ impl Host {
                     }
                     self.trim_stage = TrimStage::Trim;
                     self.rest = Rest::none();
+                    // The wake's first frame: a lone wake if the queue had
+                    // rested long (the rest of the wake's frames keep it).
+                    if let Some(rested) = self.queue_rested.take() {
+                        self.lone_wake = lone_wake(Some(rested), now);
+                    }
                     // Startup's garbage (shader compilation, first layout)
                     // is freed once, even if the window never goes idle.
                     if self.startup_trim == StartupTrim::Pending {
@@ -3975,14 +4071,8 @@ impl Host {
             // Through the region's `View::on_selection_copy`, the clipboard
             // taken only to write.
             let clipboard = self.clipboard.clone();
-            self.context.ui.copy_selection_from(|text, html| {
-                clipboard
-                    .borrow_mut()
-                    .as_mut()
-                    .is_some_and(|clipboard| match html {
-                        Some(html) => clipboard.set_rich_text(text, html).is_ok(),
-                        None => clipboard.set_text(text).is_ok(),
-                    })
+            self.context.ui.copy_selection_from(|content| {
+                (clipboard.borrow_mut().as_mut()).is_some_and(|clipboard| clipboard.write(content))
             });
             return true;
         };
@@ -4008,14 +4098,8 @@ impl Host {
             &self.context.ui,
             &editor,
             k.eq_ignore_ascii_case("x"),
-            |text, html| {
-                clipboard
-                    .borrow_mut()
-                    .as_mut()
-                    .is_some_and(|clipboard| match html {
-                        Some(html) => clipboard.set_rich_text(text, html).is_ok(),
-                        None => clipboard.set_text(text).is_ok(),
-                    })
+            |content| {
+                (clipboard.borrow_mut().as_mut()).is_some_and(|clipboard| clipboard.write(content))
             },
         );
         true
@@ -4430,10 +4514,16 @@ impl Host {
             self.options.glass,
             self.options.caption_height,
         );
-        // Opened zoomed: its buttons where the zoomed title bar has them.
+        // Opened zoomed or with its buttons placed: where its title bar has them.
         let zoom = self.context.ui.zoom();
-        if zoom != 1. {
-            crate::window_chrome::zoom_buttons(&window, self.options.titlebar, zoom);
+        let traffic_lights = self.options.traffic_lights;
+        if zoom != 1. || traffic_lights.is_some() {
+            crate::window_chrome::place_buttons(
+                &window,
+                self.options.titlebar,
+                zoom,
+                traffic_lights,
+            );
         }
         // A saved frame keeps its size.
         if self.options.titlebar != crate::Titlebar::Standard && !placed.restored {
@@ -5392,22 +5482,28 @@ impl Host {
                 {
                     self.reported_size = Some(size);
                 }
-                // AppKit lays the window's buttons out again: zoomed, they go
-                // back where the title bar has them, now and once its layout
-                // for the new size is done.
+                // AppKit lays the window's buttons out again: zoomed or placed,
+                // they go back where the title bar has them, now and once its
+                // layout for the new size is done.
                 let zoom = self.context.ui.zoom();
-                if zoom != 1.
+                let traffic_lights = self.options.traffic_lights;
+                if (zoom != 1. || traffic_lights.is_some())
                     && let Some(window) = &self.window
                 {
                     let titlebar = self.options.titlebar;
-                    crate::window_chrome::zoom_buttons(window, titlebar, zoom);
+                    crate::window_chrome::place_buttons(window, titlebar, zoom, traffic_lights);
                     self.context.window_info.refresh(window, titlebar);
                     #[cfg(target_os = "macos")]
                     {
                         let window = window.clone();
                         dispatch2::DispatchQueue::main().exec_async(move || {
                             let zoom = crate::popup_window::zoom_of(window.id());
-                            crate::window_chrome::zoom_buttons(&window, titlebar, zoom);
+                            crate::window_chrome::place_buttons(
+                                &window,
+                                titlebar,
+                                zoom,
+                                traffic_lights,
+                            );
                         });
                     }
                 }
@@ -6328,10 +6424,11 @@ impl Host {
                 scale,
             );
             // The platform's buttons where the zoomed title bar has them.
-            crate::window_chrome::zoom_buttons(
+            crate::window_chrome::place_buttons(
                 &window,
                 self.options.titlebar,
                 self.context.ui.zoom(),
+                self.options.traffic_lights,
             );
             // And where scripts read them (`ui.window.controls`).
             self.context
@@ -6857,6 +6954,17 @@ impl Host {
                     self.renderer.as_ref().is_some_and(|r| r.atlas_grown()),
                     self.renderer.is_some() && cfg!(target_os = "macos"),
                 );
+                // A lone wake gives the queue back now (`lone_wake`).
+                if queue_rests_at_trim(self.lone_wake.take(), self.context.ui.acted_at())
+                    && *QUEUE_REST_LONE
+                    && self.rest.queue
+                {
+                    self.rest.queue = false;
+                    if let Some(renderer) = &mut self.renderer {
+                        renderer.rest_queue();
+                    }
+                    self.queue_rested = Some(std::time::Instant::now());
+                }
                 self.trim_stage = TrimStage::Rest;
                 self.native.trim();
                 self.context.ui.scene.borrow_mut().rest();
@@ -6877,6 +6985,7 @@ impl Host {
                     if let Some(renderer) = &mut self.renderer {
                         renderer.rest_queue();
                     }
+                    self.queue_rested = Some(now);
                 }
             }
             // The next of what's still owed.
@@ -7970,6 +8079,68 @@ impl WindowManager {
             crate::x11_startup::complete(&window, &token);
         }
     }
+    /// Carry out the native menu items chosen so far (`NATIVE_MENU_CHOSEN`),
+    /// in the order they were chosen, each in the key window.
+    #[cfg(target_os = "macos")]
+    fn native_menu_chosen(&mut self) {
+        loop {
+            let next = NATIVE_MENU_CHOSEN
+                .lock()
+                .ok()
+                .and_then(|mut chosen| chosen.pop_front());
+            let Some(action) = next else {
+                return;
+            };
+            self.native_menu_action(action);
+        }
+    }
+    #[cfg(target_os = "macos")]
+    fn native_menu_action(&mut self, action: crate::MenuAction) {
+        // The key window: winit reports a window unfocused while a
+        // native view in it (a web page, a terminal) has first
+        // responder, so ask AppKit too.
+        let focused = self
+            .hosts
+            .iter()
+            .find(|(_, host)| host.native_focused && !host.context.window.is_closed())
+            .or_else(|| {
+                self.hosts.iter().find(|(_, host)| {
+                    !host.context.window.is_closed()
+                        && host.window.as_ref().is_some_and(|w| is_key_window(w))
+                })
+            })
+            .map(|(token, _)| *token)
+            // No key window (the app is in the background, a menu
+            // chosen through accessibility): its only window.
+            .or_else(|| {
+                let mut open = self
+                    .hosts
+                    .iter()
+                    .filter(|(_, host)| !host.context.window.is_closed());
+                match (open.next(), open.next()) {
+                    (Some((token, _)), None) => Some(*token),
+                    _ => None,
+                }
+            });
+        if let Some(token) = focused {
+            self.menu_action(token, action);
+        }
+    }
+    /// Carry out the menu actions windows' keys chose that nothing in them
+    /// took (`MENU_FALLBACKS`), in order, each in its window.
+    fn menu_fallbacks(&mut self) {
+        while let Some((token, action)) =
+            MENU_FALLBACKS.with(|queued| queued.borrow_mut().pop_front())
+        {
+            if crate::app_menu::enabled_action(&self.factory.menus.borrow(), &action)
+                && let Some(host) = self.hosts.get_mut(&token)
+                && !host.context.window.is_closed()
+                && let Some(callback) = &mut host.context.menu_action
+            {
+                callback(action);
+            }
+        }
+    }
     fn menu_action(&mut self, token: u64, action: crate::MenuAction) {
         // The window's zoom items, which zgx puts in the View menu.
         if let Some(zoom) = crate::app_menu::zoom_action(&action) {
@@ -8265,15 +8436,7 @@ impl WindowManager {
                 }
             }
             Event::MenuAction(token, action) => self.menu_action(token, action),
-            Event::MenuFallback(token, action) => {
-                if crate::app_menu::enabled_action(&self.factory.menus.borrow(), &action)
-                    && let Some(host) = self.hosts.get_mut(&token)
-                    && !host.context.window.is_closed()
-                    && let Some(callback) = &mut host.context.menu_action
-                {
-                    callback(action);
-                }
-            }
+            Event::MenuFallback => self.menu_fallbacks(),
             #[cfg(target_os = "linux")]
             Event::NativeFiles(token, event) => {
                 if let Some(host) = self.hosts.get_mut(&token)
@@ -8412,37 +8575,7 @@ impl WindowManager {
                 }
             }
             #[cfg(target_os = "macos")]
-            Event::NativeMenuAction(action) => {
-                // The key window: winit reports a window unfocused while a
-                // native view in it (a web page, a terminal) has first
-                // responder, so ask AppKit too.
-                let focused = self
-                    .hosts
-                    .iter()
-                    .find(|(_, host)| host.native_focused && !host.context.window.is_closed())
-                    .or_else(|| {
-                        self.hosts.iter().find(|(_, host)| {
-                            !host.context.window.is_closed()
-                                && host.window.as_ref().is_some_and(|w| is_key_window(w))
-                        })
-                    })
-                    .map(|(token, _)| *token)
-                    // No key window (the app is in the background, a menu
-                    // chosen through accessibility): its only window.
-                    .or_else(|| {
-                        let mut open = self
-                            .hosts
-                            .iter()
-                            .filter(|(_, host)| !host.context.window.is_closed());
-                        match (open.next(), open.next()) {
-                            (Some((token, _)), None) => Some(*token),
-                            _ => None,
-                        }
-                    });
-                if let Some(token) = focused {
-                    self.menu_action(token, action);
-                }
-            }
+            Event::NativeMenuAction => self.native_menu_chosen(),
             Event::WindowCommand(token, command) => {
                 if let Some(host) = self.hosts.get_mut(&token) {
                     if !host.context.window.is_closed() {
@@ -8919,6 +9052,21 @@ impl ApplicationHandler<Event> for WindowManager {
         }
     }
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        // A menu item chosen before this event (its shortcut, a key AppKit
+        // hands the menu first) acts before it: the event the item's handler
+        // posts can come after input queued behind its key (a key typed just
+        // after ⌘N), which would otherwise reach what had focus before.
+        #[cfg(target_os = "macos")]
+        if NATIVE_MENU_CHOSEN
+            .lock()
+            .is_ok_and(|chosen| !chosen.is_empty())
+        {
+            self.native_menu_chosen();
+        }
+        // So does a menu action an earlier event's keys chose (`MENU_FALLBACKS`).
+        if MENU_FALLBACKS.with(|queued| !queued.borrow().is_empty()) {
+            self.menu_fallbacks();
+        }
         // Motion before the press or key that came after it.
         self.flush_motion(event_loop);
         // Pointer moves come as often as the mouse reports them (Wayland
@@ -8943,6 +9091,12 @@ impl ApplicationHandler<Event> for WindowManager {
             self.flush_move(event_loop);
         }
         self.window_event_now(event_loop, id, event);
+        // A shortcut this event's key chose, that nothing in the window took:
+        // carried out now, before the next event (a key typed just after ⌘N
+        // reaches the new chat, not the old).
+        if MENU_FALLBACKS.with(|queued| !queued.borrow().is_empty()) {
+            self.menu_fallbacks();
+        }
     }
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -9796,7 +9950,7 @@ fn copy_or_cut_editor(
     ui: &zgx::widgets::Ui,
     editor: &zgx::widgets::EditorHandle,
     cut: bool,
-    write: impl FnOnce(String, Option<String>) -> bool,
+    write: impl FnOnce(zgx::widgets::ClipboardContent) -> bool,
 ) -> bool {
     ui.copy_from(editor, cut, write)
 }
@@ -9868,7 +10022,6 @@ mod tests {
 
     /// Input acting after the frame last shown draws the next at once;
     /// input the shown frame already answered doesn't.
-    #[cfg(target_os = "macos")]
     #[test]
     fn input_since_the_frame_shown_draws_at_once() {
         use super::acted_since;
@@ -9899,10 +10052,10 @@ mod tests {
                 .w(200.)
                 .h(30.)
                 .on_copy(|request| {
-                    Some(ClipboardContent {
-                        text: request.text.to_uppercase(),
-                        html: Some(format!("<i>{}</i>", request.text)),
-                    })
+                    Some(ClipboardContent::new(
+                        request.text.to_uppercase(),
+                        Some(format!("<i>{}</i>", request.text)),
+                    ))
                 }),
         );
         ui.prepare_frame();
@@ -9913,8 +10066,8 @@ mod tests {
             &ui,
             &editor,
             false,
-            |text, html| {
-                written = Some((text, html));
+            |content: ClipboardContent| {
+                written = Some((content.text, content.html));
                 true
             }
         ));
@@ -9928,8 +10081,8 @@ mod tests {
             &ui,
             &editor,
             true,
-            |text, html| {
-                written = Some((text, html));
+            |content: ClipboardContent| {
+                written = Some((content.text, content.html));
                 true
             }
         ));
@@ -9940,13 +10093,42 @@ mod tests {
         assert_eq!(value.get(), " world", "\u{2318}X deletes the selection");
         editor.set_secure(true);
         editor.set_selection(0, 6);
-        assert!(!super::copy_or_cut_editor(&ui, &editor, false, |_, _| {
+        assert!(!super::copy_or_cut_editor(&ui, &editor, false, |_| {
             panic!("a password field writes nothing")
         }));
     }
 
     /// A window at rest gives back Metal's queue, then its glyph atlas, each
     /// at its own delay past the trim, and nothing once both have gone.
+    /// A wake after a long rest with no input gives its queue back at its
+    /// trim; one soon after another, or one someone acted in, keeps it.
+    #[test]
+    fn a_lone_wake_gives_its_queue_back_at_its_trim() {
+        use super::{QUEUE_REST_DELAY, lone_wake, queue_rests_at_trim};
+        let rested = std::time::Instant::now();
+        let ms = std::time::Duration::from_millis;
+        // A clock's tick 30 s into a rest: lone.
+        let tick = rested + std::time::Duration::from_secs(30);
+        assert_eq!(lone_wake(Some(rested), tick), Some(rested));
+        assert!(queue_rests_at_trim(lone_wake(Some(rested), tick), None));
+        // Input before the queue rested doesn't count; input since does,
+        // even the click that woke it (it acts before the first frame).
+        assert!(queue_rests_at_trim(Some(rested), Some(rested - ms(5))));
+        assert!(!queue_rests_at_trim(Some(rested), Some(tick - ms(10))));
+        // A wake soon after the queue rested (updates coming every few
+        // seconds) keeps it warm, as before.
+        assert_eq!(lone_wake(Some(rested), rested + ms(3000)), None);
+        assert!(!queue_rests_at_trim(
+            lone_wake(Some(rested), rested + ms(3000)),
+            None
+        ));
+        assert_eq!(
+            lone_wake(Some(rested), rested + QUEUE_REST_DELAY),
+            Some(rested)
+        );
+        // A queue that never rested (a window's first frames): not lone.
+        assert_eq!(lone_wake(None, tick), None);
+    }
     #[test]
     fn rest_gives_back_the_atlas_then_the_queue() {
         use super::{ATLAS_TRIM_DELAY, QUEUE_REST_DELAY, Rest};

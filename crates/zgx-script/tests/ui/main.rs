@@ -18,6 +18,8 @@ mod container_queries;
 mod decision;
 #[path = "../decode_image.rs"]
 mod decode_image;
+#[path = "../dim.rs"]
+mod dim;
 #[path = "../display_contents.rs"]
 mod display_contents;
 #[path = "../drag_declined.rs"]
@@ -74,6 +76,8 @@ mod list_drag_keeps_row;
 mod list_edges;
 #[path = "../list_estimate.rs"]
 mod list_estimate;
+#[path = "../list_fading_in.rs"]
+mod list_fading_in;
 #[path = "../list_failed_key.rs"]
 mod list_failed_key;
 #[path = "../list_focus_scroll.rs"]
@@ -128,6 +132,8 @@ mod sealed;
 mod selection;
 #[path = "../size_calc.rs"]
 mod size_calc;
+#[path = "../size_tokens.rs"]
+mod size_tokens;
 #[path = "../small_element_nodes.rs"]
 mod small_element_nodes;
 #[path = "../stack.rs"]

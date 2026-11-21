@@ -79,6 +79,10 @@ pub(crate) struct NodeRare {
     /// lets it through).
     pub pointer_events: Option<Source>,
     pub disabled: Option<Source>,
+    /// `dim` given as a state or function: whether it looks disabled
+    /// (dimmed) while disabled, followed (a sending button that stays
+    /// disabled but keeps its ink).
+    pub dim: Option<Box<Source>>,
     /// `layout = "height"`: the node's size follows its content, animated.
     pub layout: Option<LayoutAnim>,
     /// `layout_id = "selection"`: a node mounting as another with the same
@@ -105,6 +109,7 @@ impl NodeRare {
     pub(crate) const NONE: NodeRare = NodeRare {
         pointer_events: None,
         disabled: None,
+        dim: None,
         layout: None,
         layout_id: None,
         mask: None,
@@ -155,6 +160,8 @@ pub(crate) struct ImageEvents {
 pub(crate) struct WebSpec {
     /// Shared with `ui.web()` when given, so the page outlives this node.
     pub web: zgx::web_view::WebView,
+    /// The id it was made under (`ui.web(id)`), what `web_guard` is told.
+    pub id: Option<String>,
     pub src: Option<Source>,
     pub html: Option<(String, Option<String>)>,
     pub on_navigate: Option<Function>,
@@ -190,12 +197,15 @@ pub(crate) struct Webs(RefCell<std::collections::HashMap<String, zgx::web_view::
 fn guarded_web(
     lua: &Lua,
     options: zgx::web_view::WebViewOptions,
+    id: Option<&str>,
 ) -> mlua::Result<zgx::web_view::WebView> {
     let env = env(lua)?;
     let web = zgx::web_view::WebView::new(&env.runtime, options);
     if matches!(*env.grants, crate::Grants::All) {
-        let vm = env.vm.clone();
-        web.set_navigation_policy(move |request| crate::rules::navigation_allowed(&vm, request));
+        let (vm, id) = (env.vm.clone(), id.map(str::to_owned));
+        web.set_navigation_policy(move |request| {
+            crate::rules::navigation_allowed(&vm, id.as_deref(), request)
+        });
     }
     Ok(web)
 }
@@ -226,7 +236,7 @@ pub(crate) fn install_web(lua: &Lua, ui: &Table, webs: Rc<Webs>) -> mlua::Result
                 (Some(plugin), Some(id)) => Some(format!("plugin:{plugin}/{id}")),
                 (_, id) => id,
             };
-            let make = |lua: &Lua| -> mlua::Result<zgx::web_view::WebView> {
+            let make = |lua: &Lua, id: Option<&str>| -> mlua::Result<zgx::web_view::WebView> {
                 let mut options: zgx::web_view::WebViewOptions = match &opts {
                     Some(t) => web_options(t)?,
                     None => Default::default(),
@@ -241,16 +251,16 @@ pub(crate) fn install_web(lua: &Lua, ui: &Table, webs: Rc<Webs>) -> mlua::Result
                         WebProfile::Ephemeral => WebProfile::Ephemeral,
                     };
                 }
-                guarded_web(lua, options)
+                guarded_web(lua, options, id)
             };
             let Some(id) = id else {
-                return Ok(WebUd(make(lua)?, None));
+                return Ok(WebUd(make(lua, None)?, None));
             };
             let existing = webs.0.borrow().get(&id).cloned();
             let web = match existing {
                 Some(web) => web,
                 None => {
-                    let web = make(lua)?;
+                    let web = make(lua, Some(&id))?;
                     webs.0.borrow_mut().insert(id.clone(), web.clone());
                     web
                 }
@@ -264,6 +274,12 @@ pub(crate) fn install_web(lua: &Lua, ui: &Table, webs: Rc<Webs>) -> mlua::Result
             ))
         })?,
     )
+}
+impl WebUd {
+    /// The id it was made under (`ui.web(id)`), none for an anonymous one.
+    fn id(&self) -> Option<&str> {
+        self.1.as_ref().map(|key| key.id.as_str())
+    }
 }
 impl UserData for WebUd {
     fn add_fields<F: mlua::UserDataFields<Self>>(fields: &mut F) {
@@ -293,13 +309,13 @@ impl UserData for WebUd {
     }
     fn add_methods<M: mlua::UserDataMethods<Self>>(methods: &mut M) {
         methods.add_method("load", |lua, w, url: String| {
-            crate::rules::guard(lua, crate::GuardKind::Web, &url)?;
+            crate::rules::guard_web(lua, w.id(), &url)?;
             w.0.load_url(url);
             Ok(())
         });
         methods.add_method("html", |lua, w, (html, base): (String, Option<String>)| {
             let name = base.as_deref().unwrap_or("about:blank");
-            crate::rules::guard(lua, crate::GuardKind::Web, name)?;
+            crate::rules::guard_web(lua, w.id(), name)?;
             w.0.load_html(html, base.as_deref());
             Ok(())
         });
@@ -4338,6 +4354,15 @@ fn late_field(lua: &Lua, node: &mut Node, name: &str, value: mlua::Value) -> mlu
                     Some(source(lua, Ty::Num, "level", value)?);
             }
         },
+        // Whether a disabled control is dimmed (few nodes say, so here, off
+        // the common properties' path): `false` keeps it as it is while
+        // disabled, still disabled to input and assistive technology; a
+        // state or function decides as it changes. Kept until the node's
+        // fields are all read (`variants::dimmed`).
+        "dim" => match value {
+            mlua::Value::Boolean(true) => {}
+            value => node.rare_mut().dim = Some(Box::new(source(lua, Ty::Bool, "dim", value)?)),
+        },
         "at_caret" => {
             if let Kind::Popover { at_caret, .. } = &mut node.kind {
                 *at_caret = lua.unpack::<Option<bool>>(value)?.unwrap_or(false);
@@ -5165,6 +5190,10 @@ fn fill_from(
         layout.height = false;
         layout.position = true;
     }
+    // `dim`: one more variant, chosen as it says.
+    if node.rare.as_ref().is_some_and(|rare| rare.dim.is_some()) {
+        variants = Some(crate::variants::dimmed(lua, node, variants.take())?);
+    }
     // What the element's variants set and it does not.
     if let Some(selection) = variants {
         crate::variants::apply(node, selection);
@@ -5799,20 +5828,29 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
     ui.set(
         "markdown_view",
         lua.create_function(|lua, table: Table| {
-            // Its own options, read before the styles are.
-            let flag = |name: &str, default: bool| -> mlua::Result<bool> {
-                let value = table.get::<Option<bool>>(name)?.unwrap_or(default);
-                table.raw_set(name, mlua::Value::Nil)?;
-                Ok(value)
+            // Its own options, read (raw, by the VM's names for them) and
+            // taken out before the styles are.
+            let keys = crate::markdown::keys(lua)?;
+            let flag = |key: &mlua::LuaString, default: bool| -> mlua::Result<bool> {
+                Ok(match table.raw_get::<Option<bool>>(key)? {
+                    Some(value) => {
+                        table.raw_set(key, mlua::Value::Nil)?;
+                        value
+                    }
+                    None => default,
+                })
             };
             let options = crate::markdown::view::ViewOptions {
                 parse: crate::markdown::Options {
-                    breaks: flag("breaks", false)?,
-                    paths: flag("paths", false)?,
+                    breaks: flag(&keys.breaks, false)?,
+                    paths: flag(&keys.paths, false)?,
+                    html_marks: flag(&keys.html_marks, false)?,
+                    autolinks: flag(&keys.autolinks, false)?,
                     code: None,
                 },
-                copy: flag("copy", true)?,
+                copy: flag(&keys.copy, true)?,
             };
+            drop(keys);
             let mut args = TextArgs::default();
             let empty = Kind::Text(Text::Literal(String::new()));
             let (owner, lint) = owner_and_lint(lua)?;
@@ -6890,9 +6928,12 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
         "webview",
         lua.create_function(|lua, table: Table| {
             env(lua)?.may(crate::Capability::Web, "ui.webview")?;
-            let web = match table.get::<mlua::Value>("web")? {
-                mlua::Value::Nil => guarded_web(lua, web_options(&table)?)?,
-                mlua::Value::UserData(ud) => ud.borrow::<WebUd>()?.0.clone(),
+            let (web, id) = match table.get::<mlua::Value>("web")? {
+                mlua::Value::Nil => (guarded_web(lua, web_options(&table)?, None)?, None),
+                mlua::Value::UserData(ud) => {
+                    let web = ud.borrow::<WebUd>()?;
+                    (web.0.clone(), web.id().map(str::to_owned))
+                }
                 other => {
                     return Err(mlua::Error::runtime(format!(
                         "`web` takes a ui.web(), not {}",
@@ -6913,6 +6954,7 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
             let handler = |key: &str| table.get::<Option<Function>>(key);
             let spec = WebSpec {
                 web,
+                id,
                 src,
                 html,
                 on_navigate: handler("on_navigate")?,
